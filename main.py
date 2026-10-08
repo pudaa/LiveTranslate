@@ -48,6 +48,7 @@ from livetranslate.asr.client import ASRClient, ASRWorkerError, ASRWorkerExited,
 from livetranslate.translate.translator import Translator, RepetitionError
 from livetranslate.translate.modes import CAPTIONS, normalize as normalize_pipeline_mode
 from livetranslate.output.transcript import TranscriptWriter
+from livetranslate.output.srt import SRTWriter
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
 from PyQt6.QtGui import (
@@ -239,6 +240,16 @@ class LiveTranslateApp:
         self._tl_executor = ThreadPoolExecutor(max_workers=8)
 
         self._transcript = TranscriptWriter(TRANSCRIPTS_DIR)
+        # SRT export: cue times come from the captured-audio clock (below), not
+        # the wall clock, so dropped audio cannot slide the captions against the
+        # video. Enabled up front -- "watch a video, keep the subtitles" is the
+        # point of this fork, and the file lands in transcripts/ with the .txt.
+        self._srt = SRTWriter(
+            TRANSCRIPTS_DIR,
+            enabled=bool((config.get("output") or {}).get("srt", True)),
+        )
+        self._audio_clock_s = 0.0   # seconds of audio consumed since start()
+        self._srt_cursor_s = 0.0    # end of the last cue written
 
         # Memory diagnostic state
         import psutil
@@ -343,6 +354,8 @@ class LiveTranslateApp:
             self._translator.set_timeout(settings["timeout"])
         if "auto_save_transcript" in settings:
             self._transcript.set_enabled(settings["auto_save_transcript"])
+        if "save_srt" in settings:
+            self._srt.set_enabled(settings["save_srt"])
 
     def _mark_asr_unavailable(self, reason: str, client=None):
         with self._asr_lock:
@@ -1185,6 +1198,8 @@ class LiveTranslateApp:
         self._asr_queue = queue.Queue(maxsize=16)
         self._running = True
         self._paused = False
+        self._audio_clock_s = 0.0
+        self._srt_cursor_s = 0.0
         self._audio.start()
         self._capture_thread = threading.Thread(
             target=self._capture_loop, daemon=True
@@ -1223,11 +1238,11 @@ class LiveTranslateApp:
         if self._interim_active:
             remaining = self._vad.force_flush()
             if remaining is not None and self._asr_ready:
-                self._process_interim_final(remaining)
+                self._process_interim_final(remaining, self._audio_clock_s)
         else:
             remaining = self._vad.flush()
             if remaining is not None and self._asr_ready:
-                self._process_segment(remaining)
+                self._process_segment(remaining, self._audio_clock_s)
         self._interim_active = False
         self._interim_pending = ""
         self._last_interim_samples = 0
@@ -1235,6 +1250,7 @@ class LiveTranslateApp:
         self._interim_committed_tail = ""
         self._tl_executor.shutdown(wait=True)
         self._transcript.close()
+        self._srt.close()
         if self._mem_periodic_timer is not None:
             try:
                 self._mem_periodic_timer.stop()
@@ -1266,7 +1282,7 @@ class LiveTranslateApp:
         self._paused = False
         log.info("Pipeline resumed")
 
-    def _process_segment(self, speech_segment):
+    def _process_segment(self, speech_segment, t_end=None):
         """Run ASR + translation on a speech segment. Called from ASR thread and stop()."""
         seg_len = len(speech_segment) / 16000
         log.info(f"Speech segment: {seg_len:.1f}s")
@@ -1319,6 +1335,7 @@ class LiveTranslateApp:
                 msg_id, timestamp, original_text, source_lang, asr_ms
             )
         self._transcript.write_original(msg_id, timestamp, original_text)
+        self._srt_emit(original_text, duration_hint=seg_len, t_end=t_end)
 
         # Store for subtitle window (translation will be added later)
         self._last_original = original_text
@@ -1501,7 +1518,7 @@ class LiveTranslateApp:
         log.info(f"Interim ASR: committed {len(complete)} sentence(s), trimmed {trim_samples / 16000:.2f}s")
         return True
 
-    def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0):
+    def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0, t_end=None):
         """Output a text result (from interim or final) — similar to _process_segment but skips ASR."""
         original_text = text.strip()
         if not original_text or not any(c.isalnum() for c in original_text):
@@ -1521,11 +1538,40 @@ class LiveTranslateApp:
         if self._overlay:
             self._overlay.add_message(msg_id, timestamp, original_text, source_lang, asr_ms)
         self._transcript.write_original(msg_id, timestamp, original_text)
+        self._srt_emit(original_text, t_end=t_end)
 
         self._last_original = original_text
         self._last_msg_id = msg_id
 
         self._dispatch_output(msg_id, original_text, source_lang)
+
+    def _srt_emit(self, text: str, translation: str = "", duration_hint: float = 0.0,
+                  t_end: float | None = None):
+        """Record one SRT cue.
+
+        Times are seconds on the captured-audio clock, not the wall clock: audio
+        that was dropped (full ASR queue, a pause, a device restart) never played
+        in the recording either, so using the wall clock would slide the captions
+        against the video. ``t_end`` is the clock reading snapshotted at VAD flush
+        time -- using the current reading instead would push every cue late by the
+        ASR latency.
+        """
+        if not self._srt.is_enabled():
+            return
+        end = self._audio_clock_s if t_end is None else t_end
+        if duration_hint and duration_hint > 0:
+            # Preferred: the cue covers the audio that actually produced it.
+            start = max(self._srt_cursor_s, end - duration_hint)
+        else:
+            # No duration available (the incremental path): let the cue span from
+            # the previous cue to now. Collapsing it to `end` instead would push
+            # the cue *past* the speech it belongs to once the minimum-duration
+            # rule pads it out.
+            start = self._srt_cursor_s
+        if start > end:
+            start = end
+        self._srt.write(start, end, text, translation)
+        self._srt_cursor_s = max(end, start)
 
     def _dispatch_output(self, msg_id, text, source_lang):
         """Route a recognized text result to the overlay and subtitle window.
@@ -1594,7 +1640,7 @@ class LiveTranslateApp:
                 )
             except RuntimeError:
                 log.warning("Translation executor shut down, skipping")
-    def _process_interim_final(self, speech_segment):
+    def _process_interim_final(self, speech_segment, t_end=None):
         """Handle VAD flush after interim outputs were already made."""
         seg_len = len(speech_segment) / 16000
         log.info(f"Interim final segment: {seg_len:.1f}s")
@@ -1615,7 +1661,7 @@ class LiveTranslateApp:
                 lang = self._panel.get_settings().get("asr_language", "auto") if self._panel else "auto"
                 if lang == "auto":
                     lang = "unknown"
-                self._process_segment_text(text, lang)
+                self._process_segment_text(text, lang, t_end=t_end)
             return
 
         original_text = result["text"].strip()
@@ -1637,7 +1683,7 @@ class LiveTranslateApp:
             log.debug(f"Noise filter: {seg_len:.1f}s segment produced only '{original_text}', skipping")
             return
 
-        self._process_segment_text(original_text, result["language"], asr_ms)
+        self._process_segment_text(original_text, result["language"], asr_ms, t_end=t_end)
 
     def _capture_loop(self):
         silence_chunk = np.zeros(
@@ -1653,14 +1699,18 @@ class LiveTranslateApp:
                 if self._vad._is_speaking and not self._paused:
                     n = self._vad._get_effective_silence_limit() + 1
                     for _ in range(n):
+                        # Silence is still audio that played; advancing the clock
+                        # keeps the SRT timeline aligned with the video.
+                        self._audio_clock_s += len(silence_chunk) / 16000.0
                         with self._vad_lock:
                             seg = self._vad.process_chunk(silence_chunk)
                         if seg is not None and self._asr_ready:
-                            self._enqueue_asr("vad_flush", seg)
+                            self._enqueue_asr("vad_flush", seg, self._audio_clock_s)
                             break
                 continue
 
             chunk, mic_rms = item
+            self._audio_clock_s += len(chunk) / 16000.0
 
             if self._paused:
                 continue
@@ -1691,11 +1741,11 @@ class LiveTranslateApp:
                 log.debug("ASR not ready, dropping segment")
                 continue
 
-            self._enqueue_asr("vad_flush", speech_segment)
+            self._enqueue_asr("vad_flush", speech_segment, self._audio_clock_s)
 
-    def _enqueue_asr(self, seg_type: str, segment):
+    def _enqueue_asr(self, seg_type: str, segment, t_end: float | None = None):
         try:
-            self._asr_queue.put_nowait((seg_type, segment))
+            self._asr_queue.put_nowait((seg_type, segment, t_end))
         except queue.Full:
             try:
                 dropped = self._asr_queue.get_nowait()
@@ -1703,9 +1753,9 @@ class LiveTranslateApp:
             except queue.Empty:
                 pass
             try:
-                self._asr_queue.put_nowait((seg_type, segment))
+                self._asr_queue.put_nowait((seg_type, segment, t_end))
             except queue.Full:
-                log.warning("ASR queue still full after drop, skipping segment")
+                log.warning("ASR queue still full after skipping segment")
 
     def _asr_loop(self):
         while self._running:
@@ -1724,13 +1774,13 @@ class LiveTranslateApp:
             if item is None:
                 break
 
-            seg_type, segment = item
+            seg_type, segment, t_end = item
 
             if seg_type == "vad_flush":
                 if self._interim_active:
-                    self._process_interim_final(segment)
+                    self._process_interim_final(segment, t_end)
                 else:
-                    self._process_segment(segment)
+                    self._process_segment(segment, t_end)
                 self._interim_active = False
                 self._interim_pending = ""
                 self._last_interim_samples = 0

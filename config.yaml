@@ -9,6 +9,12 @@ pipeline:
   #               behaviour; the overlay shows original + translation).
   mode: "translate"
 
+output:
+  # Write a .srt alongside the .txt transcript, in the same transcripts/ folder.
+  # Cue times come from the captured-audio clock, so this is the file to attach
+  # to the video afterwards. Set false to only keep the plain transcript.
+  srt: true
+
 audio:
   # WASAPI loopback device name (null = default output device)
   device: null

@@ -232,6 +232,58 @@ def _presets():
             f"subtitle-window cinema presets")
 
 
+def _pipeline_srt():
+    """Drive the real pipeline dispatch and assert captions mode + SRT export.
+
+    This is the fork's core promise in one check: with pipeline.mode=captions the
+    translator must never be submitted to, and the recognised text must still land
+    in an .srt with audio-clock cue times.
+    """
+    import tempfile
+
+    import yaml
+
+    from livetranslate.output.srt import SRTWriter
+    from livetranslate.output.transcript import TranscriptWriter
+    from livetranslate.paths import CONFIG_FILE
+    from livetranslate.translate import modes
+    from main import LiveTranslateApp
+
+    cfg = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8"))
+    cfg.setdefault("pipeline", {})["mode"] = "captions"
+
+    app = LiveTranslateApp(cfg)
+    assert app._pipeline_mode == modes.CAPTIONS, app._pipeline_mode
+    assert app._srt.is_enabled(), "SRT export should default to on"
+
+    tmp = Path(tempfile.mkdtemp(prefix="lt-srt-check-"))
+    app._transcript = TranscriptWriter(tmp)
+    app._srt = SRTWriter(tmp, enabled=True)
+
+    submitted = []
+    app._tl_executor.submit = lambda *a, **k: submitted.append(a)
+
+    app._audio_clock_s = 10.0
+    app._process_segment_text("第一句中文字幕。", "zh", 120.0, t_end=3.0)
+    app._audio_clock_s = 16.0
+    app._process_segment_text("第二句中文字幕。", "zh", 110.0, t_end=12.0)
+    app._srt.close()
+
+    assert submitted == [], f"captions mode submitted to the translator: {submitted}"
+
+    body = app._srt.path.read_text(encoding="utf-8")
+    assert body.startswith("1\n00:00:00,000 --> 00:00:03,000\n"), body[:60]
+    assert "00:00:03,001 --> 00:00:12,000" in body, body
+    assert "第一句中文字幕。" in body and "第二句中文字幕。" in body
+
+    # translate mode must reach the translator (upstream behaviour preserved)
+    app._pipeline_mode = modes.TRANSLATE
+    app._process_segment_text("third", "en", 100.0, t_end=20.0)
+    assert len(submitted) == 1, "translate mode did not submit a translation"
+
+    return "captions never translates, SRT cues use the audio clock, translate still submits"
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("2. import every module", _import_all)
@@ -241,6 +293,7 @@ def main() -> int:
     check("6. ASR worker survives spawn", _worker_spawn)
     check("7. pipeline modes", _modes)
     check("8. cinema style presets", _presets)
+    check("9. pipeline -> captions + SRT export", _pipeline_srt)
 
     print("PASSED:")
     for p in PASS:

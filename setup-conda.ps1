@@ -29,8 +29,18 @@
     pip index for the non-torch requirements. Defaults to the Tsinghua mirror.
 
 .PARAMETER TorchWheelDir
-    Directory holding pre-downloaded torch-<Cuda>.whl and torchaudio-<Cuda>.whl.
-    Default: .pip-cache\wheels
+    Directory to look for pre-downloaded torch wheels. Default: .pip-cache\wheels
+    The wheel must keep its upstream filename, e.g.
+        torch-2.6.0+cu124-cp312-cp312-win_amd64.whl
+        torchaudio-2.6.0+cu124-cp312-cp312-win_amd64.whl
+    pip validates wheel filenames (PEP 427), so a renamed file such as
+    "torch-cu124.whl" is rejected with "Invalid wheel filename".
+
+.PARAMETER TorchWheelPath
+    Explicit path to the torch wheel, bypassing the directory search.
+
+.PARAMETER TorchAudioWheelPath
+    Explicit path to the torchaudio wheel, bypassing the directory search.
 
 .PARAMETER SkipModels
     Skip pre-fetching the Silero VAD + SenseVoice models (~1 GB).
@@ -42,6 +52,11 @@
     powershell -ExecutionPolicy Bypass -File .\setup-conda.ps1
 
 .EXAMPLE
+    # Use a wheel you downloaded elsewhere, e.g. straight into Downloads
+    powershell -ExecutionPolicy Bypass -File .\setup-conda.ps1 `
+        -TorchWheelPath "$env:USERPROFILE\Downloads\torch-2.6.0+cu124-cp312-cp312-win_amd64.whl"
+
+.EXAMPLE
     # CPU-only env, e.g. to run the test suite on a machine without a GPU
     powershell -ExecutionPolicy Bypass -File .\setup-conda.ps1 -Cuda cpu
 #>
@@ -51,6 +66,8 @@ param(
     [string]$Cuda = "cu124",
     [string]$Index = "https://pypi.tuna.tsinghua.edu.cn/simple",
     [string]$TorchWheelDir = "",
+    [string]$TorchWheelPath = "",
+    [string]$TorchAudioWheelPath = "",
     [switch]$SkipModels,
     [switch]$SkipVerify
 )
@@ -73,6 +90,30 @@ function Get-EnvPython($name) {
     $out = & conda run -n $name python -c $code 2>$null
     if (-not $out) { throw "could not resolve the python for conda env '$name'" }
     return ($out | Select-Object -Last 1).Trim()
+}
+
+# Find a pre-downloaded wheel by its upstream name, e.g.
+#   torch-2.6.0+cu124-cp312-cp312-win_amd64.whl
+# The full PEP 427 name matters: pip parses it, and rejects anything it cannot
+# split into name-version-python-abi-platform ("Invalid wheel filename").
+function Find-Wheel($dir, $prefix, $cuda, $explicit) {
+    if (-not [string]::IsNullOrWhiteSpace($explicit)) {
+        if (-not (Test-Path -LiteralPath $explicit)) { throw "wheel not found: $explicit" }
+        return (Resolve-Path -LiteralPath $explicit).Path
+    }
+    $pattern = Join-Path $dir "$prefix-*-$cuda-*.whl"
+    $hit = Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    if ($hit) { return $hit.FullName }
+
+    # A renamed wheel is a common trap -- report it specifically instead of
+    # silently falling through to the slow network download.
+    $shortName = Join-Path $dir "$prefix-$cuda.whl"
+    if (Test-Path -LiteralPath $shortName) {
+        throw ("found '$shortName', but pip rejects renamed wheels. Rename it back " +
+               "to its upstream name (e.g. $prefix-2.6.0+$cuda-cp312-cp312-win_amd64.whl).")
+    }
+    return ""
 }
 
 # ── 1. conda env ────────────────────────────────────────────────────────────
@@ -100,12 +141,16 @@ Write-Host "  python: $Py"
 # ── 2. PyTorch ──────────────────────────────────────────────────────────────
 Write-Step "2/5" "PyTorch ($Cuda)"
 
-$torchWheel = Join-Path $TorchWheelDir "torch-$Cuda.whl"
-$audioWheel = Join-Path $TorchWheelDir "torchaudio-$Cuda.whl"
+$torchWheel = Find-Wheel $TorchWheelDir "torch" $Cuda $TorchWheelPath
+$audioWheel = Find-Wheel $TorchWheelDir "torchaudio" $Cuda $TorchAudioWheelPath
 
-if ((Test-Path $torchWheel) -and (Test-Path $audioWheel)) {
-    Write-Host "  installing from local wheels in $TorchWheelDir"
-    & $Py -m pip install $torchWheel $audioWheel
+if ($torchWheel -and $audioWheel) {
+    Write-Host "  installing from local wheels:"
+    Write-Host "    $torchWheel" -ForegroundColor DarkGray
+    Write-Host "    $audioWheel" -ForegroundColor DarkGray
+    # --no-deps: the CUDA wheels only need pure-python deps already covered by
+    # requirements.txt, and letting pip resolve them would try the slow index.
+    & $Py -m pip install --no-deps $torchWheel $audioWheel
     if ($LASTEXITCODE -ne 0) { throw "local torch wheel install failed" }
 }
 elseif ($Cuda -eq "cpu") {
@@ -114,11 +159,12 @@ elseif ($Cuda -eq "cpu") {
     if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
 }
 else {
-    Write-Host "  no local wheel at $torchWheel"
+    Write-Host "  no local wheel found in $TorchWheelDir" -ForegroundColor Yellow
     Write-Host "  falling back to download.pytorch.org -- this is the slow one." -ForegroundColor Yellow
-    Write-Host "  To avoid it, download the wheels yourself (resumable):" -ForegroundColor Yellow
-    Write-Host "    curl.exe -L -C - --retry 30 -o `"$torchWheel`" ``" -ForegroundColor DarkGray
-    Write-Host "      `"https://download.pytorch.org/whl/$Cuda/torch-2.6.0%2B$Cuda-cp312-cp312-win_amd64.whl`"" -ForegroundColor DarkGray
+    Write-Host "  Recommended: download the wheel yourself first (resumable), then re-run" -ForegroundColor Yellow
+    Write-Host "  this script with -TorchWheelPath. Expected sha256 for cu124/cp312:" -ForegroundColor Yellow
+    Write-Host "    3313061c1fec4c7310cf47944e84513dcd27b6173b72a349bb7ca68d0ee6e9c0" -ForegroundColor DarkGray
+    Write-Host "  Verify a download with:  Get-FileHash <wheel> -Algorithm SHA256" -ForegroundColor DarkGray
     & $Py -m pip install torch torchaudio --index-url "https://download.pytorch.org/whl/$Cuda"
     if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
 }

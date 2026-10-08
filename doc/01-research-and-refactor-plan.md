@@ -534,9 +534,35 @@ pip install -r requirements.txt
 
 | 阶段 | 状态 |
 |---|---|
-| P0 conda 环境 | ✅ env `livetranslate`（Python 3.12）；CPU torch 2.14.1 已装并跑通全部验证；**CUDA wheel 待老大下载后换上** |
+| P0 conda 环境 | ✅ env `livetranslate`（Python 3.12）+ **CUDA torch 2.6.0+cu124**；RTX 4060 Laptop 认到，capability (8,9)=sm_89；**SenseVoice 已在 GPU 上跑通真实转写** |
 | P1 搬目录 | ✅ 提交 `5715bcb` |
 | P2 解耦 | ✅ 提交 `337abbe` |
-| P3 电影字幕 | ✅ 代码与验证完成 |
-| P4 优化 | ⏳ SRT 导出 / 内存修复 / 音频源过滤 A+B |
+| P3 电影字幕 | ✅ 提交 `bdb0233` |
+| **P4.1 SRT 导出** | ✅ 见下 |
+| P4.2 内存修复 | ⏳ |
+| P4.3 音频源过滤 A+B | ⏳ |
+
+### 10.6 P4.1 录制与导出 SRT
+
+**做法**：新增 `livetranslate/output/srt.py`（`SRTWriter`），与 `.txt` 转录**并行**写入 `transcripts/`，流式追加——播完文件即完整，中途崩溃也留下可用前缀。
+
+**关键设计：时间轴用「捕获音频时钟」而不是墙钟。**
+`_capture_loop` 每消费一个 chunk 就累加 `_audio_clock_s`（`len(chunk)/16000`）。理由是：被丢掉的音频（ASR 队列满、暂停、设备重启）本来就不在录像里，用墙钟会让字幕相对视频**越走越偏**——而字幕文件只有对齐才有用。
+
+**第二个关键点**：cue 的 `t_end` 取 **VAD flush 时刻**快照的时钟读数（随队列一起传下去），不是 ASR 出结果时的读数。否则每条 cue 都会被**ASR 延迟**整体推后几百毫秒。
+
+**实测抓到的两个问题（已修）**：
+1. 无时长提示时，我最初写成 `start = end - 0` → cue 塌缩成一点，再被「最小时长 0.8s」补成 `[3.0, 3.8]`，**落在语音结束之后**。正确行为是从上一 cue 结束延伸到现在。
+2. `pip` **会校验 wheel 文件名**（PEP 427）。我图方便把 torchaudio 存成 `torchaudio-cu124.whl`，直接报 `Invalid wheel filename (wrong number of parts)`。**必须保留官方原始文件名**（`torchaudio-2.6.0+cu124-cp312-cp312-win_amd64.whl`）。这条已写进 `setup-conda.ps1`，并在检测到重命名文件时给出明确报错而不是静默回退到慢速网络下载。
+
+**配套**：`tests/test_srt_writer.py`（10 个用例：时间戳格式、最小时长、禁止重叠、空文本跳过、时间倒置修复、双语双行、运行时开关），以及 `verify_runtime.py` 的第 9 项——**驱动真实管线**确认 `captions` 模式**从不向翻译器提交任务**、且 SRT cue 用音频时钟落盘。
+
+### 10.7 CUDA 环境验证
+
+`doc/migrations/check_gpu_asr.py`：加载真实 SenseVoice 到真实 GPU 并跑一次转写。这是唯一能抓到 CUDA/DLL 问题（torch 构建不对、驱动不匹配、缺 cudnn）的手段——这类问题在模型碰到设备之前完全不可见。
+
+实测结果：`worker ready 71.7s` → `SenseVoice loaded ... <All keys matched successfully>` → GPU 转写 1013ms。
+
+> **待优化（下一轮）**：worker 冷启动 71.7s 偏长。`multiprocessing` 的 spawn 会用 `_fixup_main_from_path` **重新 import 入口 `main.py`**，而 `main.py` 顶部有 `import torch` + PyQt6——也就是说**每次起 ASR worker 都白跑一遍 GUI 的 import**。把 worker 入口挪到一个轻量模块可以省掉这部分。
+
 
