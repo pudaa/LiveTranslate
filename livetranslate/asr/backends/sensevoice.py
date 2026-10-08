@@ -27,7 +27,7 @@ class SenseVoiceEngine:
 
     def __init__(self, model_name=None, device="cuda", hub="ms", pad_seconds=None):
         from funasr import AutoModel
-        from model_manager import (
+        from livetranslate.models.manager import (
             get_local_model_path,
             asr_model_id,
             neutralize_funasr_requirements,

@@ -29,13 +29,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from benchmark import run_benchmark
-from dialogs import (
+from livetranslate.benchmark import run_benchmark
+from livetranslate.ui.dialogs import (
     ModelEditDialog,
     available_screen_height,
     make_scroll_area,
 )
-from model_manager import (
+from livetranslate.models.manager import (
     DEFAULT_FUNASR_MODEL,
     MODELS_DIR,
     _WHISPER_SIZES,
@@ -49,12 +49,11 @@ from model_manager import (
     normalize_funasr_model_key,
     resolve_custom_whisper_model,
 )
-from i18n import t, LANGUAGES
-from subtitle_settings import SubtitleSettingsWidget
+from livetranslate.paths import SETTINGS_FILE, TRANSCRIPTS_DIR
+from livetranslate.ui.i18n import t, LANGUAGES
+from livetranslate.ui.subtitle_settings import SubtitleSettingsWidget
 
 log = logging.getLogger("LiveTranslate.Panel")
-
-SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
 
 
 def _load_saved_settings() -> dict | None:
@@ -320,7 +319,7 @@ class ControlPanel(QWidget):
         self._audio_device.addItem(t("audio_disabled"))
         self._audio_device.addItem(t("system_default"))
         try:
-            from audio_capture import list_output_devices
+            from livetranslate.audio.capture import list_output_devices
 
             for name in list_output_devices():
                 self._audio_device.addItem(name)
@@ -343,7 +342,7 @@ class ControlPanel(QWidget):
         self._mic_device.addItem(t("mic_disabled"))
         self._mic_device.addItem(t("system_default"))
         try:
-            from audio_capture import list_input_devices
+            from livetranslate.audio.capture import list_input_devices
 
             for name in list_input_devices():
                 self._mic_device.addItem(name)
@@ -371,7 +370,7 @@ class ControlPanel(QWidget):
 
         self._ui_lang_combo = QComboBox()
         self._ui_lang_combo.addItems(["English", "中文"])
-        from i18n import get_lang
+        from livetranslate.ui.i18n import get_lang
 
         saved_lang = s.get("ui_lang", get_lang())
         self._ui_lang_combo.setCurrentIndex(0 if saved_lang == "en" else 1)
@@ -566,7 +565,7 @@ class ControlPanel(QWidget):
         prompt_group = QGroupBox(t("group_system_prompt"))
         prompt_layout = QVBoxLayout(prompt_group)
 
-        from translator import DEFAULT_PROMPT, PROMPT_PRESETS
+        from livetranslate.translate.translator import DEFAULT_PROMPT, PROMPT_PRESETS
 
         # Preset selector
         preset_row = QHBoxLayout()
@@ -626,7 +625,7 @@ class ControlPanel(QWidget):
     # ── Style Tab ──
 
     def _create_style_tab(self):
-        from subtitle_overlay import DEFAULT_STYLE
+        from livetranslate.ui.overlay import DEFAULT_STYLE
 
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -892,7 +891,7 @@ class ControlPanel(QWidget):
         self._window_opacity.setValue(s["window_opacity"])
 
     def _on_preset_changed(self, index):
-        from subtitle_overlay import STYLE_PRESETS
+        from livetranslate.ui.overlay import STYLE_PRESETS
 
         key = self._preset_keys[index]
         if key == "custom":
@@ -915,7 +914,7 @@ class ControlPanel(QWidget):
         self._auto_save()
 
     def _reset_style(self):
-        from subtitle_overlay import DEFAULT_STYLE
+        from livetranslate.ui.overlay import DEFAULT_STYLE
 
         self._style_preset.blockSignals(True)
         self._style_preset.setCurrentIndex(0)  # default
@@ -990,7 +989,7 @@ class ControlPanel(QWidget):
     # ── Cache Tab ──
 
     def _create_changelog_tab(self):
-        from dialogs import _load_latest_changelog
+        from livetranslate.ui.dialogs import _load_latest_changelog
         widget = QWidget()
         layout = QVBoxLayout(widget)
         _, html = _load_latest_changelog()
@@ -1050,8 +1049,7 @@ class ControlPanel(QWidget):
         return widget
 
     def _open_transcripts_folder(self):
-        from pathlib import Path
-        ts_dir = Path(__file__).parent / "transcripts"
+        ts_dir = TRANSCRIPTS_DIR
         ts_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(str(ts_dir))
 
@@ -1179,7 +1177,7 @@ class ControlPanel(QWidget):
             self._whisper_size_combo.setCurrentIndex(idx)
 
     def _update_whisper_size_label(self):
-        from model_manager import is_asr_cached, _MODEL_SIZE_BYTES
+        from livetranslate.models.manager import is_asr_cached, _MODEL_SIZE_BYTES
 
         size = self._selected_whisper_model()
         cached = is_asr_cached("whisper", size, self._current_settings.get("hub", "ms"))
@@ -1208,14 +1206,14 @@ class ControlPanel(QWidget):
         )
         self._update_whisper_size_label()
         # If already cached, switch engine immediately
-        from model_manager import is_asr_cached
+        from livetranslate.models.manager import is_asr_cached
 
         size = self._selected_whisper_model()
         if is_asr_cached("whisper", size, self._current_settings.get("hub", "ms")):
             self._auto_save()
 
     def _download_whisper(self):
-        from model_manager import is_asr_cached, get_missing_models
+        from livetranslate.models.manager import is_asr_cached, get_missing_models
 
         size = self._selected_whisper_model()
         if size not in _WHISPER_SIZES:
@@ -1227,7 +1225,7 @@ class ControlPanel(QWidget):
         missing = [m for m in missing if m["type"] != "silero-vad"]
         if not missing:
             return
-        from dialogs import ModelDownloadDialog
+        from livetranslate.ui.dialogs import ModelDownloadDialog
 
         dlg = ModelDownloadDialog(missing, hub=hub, parent=self)
         if dlg.exec() == dlg.DialogCode.Accepted:
@@ -1333,7 +1331,7 @@ class ControlPanel(QWidget):
         self._bench_btn.setText(t("testing"))
         self._bench_output.clear()
 
-        from translator import DEFAULT_PROMPT, LANGUAGE_DISPLAY
+        from livetranslate.translate.translator import DEFAULT_PROMPT, LANGUAGE_DISPLAY
 
         src = LANGUAGE_DISPLAY.get(source_lang, source_lang)
         tgt = LANGUAGE_DISPLAY.get(target_lang, target_lang)
@@ -1391,7 +1389,7 @@ class ControlPanel(QWidget):
         lang = "en" if index == 0 else "zh"
         self._current_settings["ui_lang"] = lang
         _save_settings(self._current_settings)
-        from i18n import set_lang
+        from livetranslate.ui.i18n import set_lang
 
         set_lang(lang)
         from PyQt6.QtWidgets import QMessageBox
@@ -1411,7 +1409,7 @@ class ControlPanel(QWidget):
         _save_settings(self._current_settings)
 
     def _on_prompt_preset_changed(self, index):
-        from translator import DEFAULT_PROMPT, PROMPT_PRESETS
+        from livetranslate.translate.translator import DEFAULT_PROMPT, PROMPT_PRESETS
         key = self._prompt_preset.itemData(index)
         if key == "custom":
             return
@@ -1429,7 +1427,7 @@ class ControlPanel(QWidget):
             _save_settings(self._current_settings)
             log.info("System prompt updated")
             # Update preset combo to reflect current state
-            from translator import PROMPT_PRESETS
+            from livetranslate.translate.translator import PROMPT_PRESETS
             self._prompt_preset.blockSignals(True)
             matched = 4  # custom
             for i, key in enumerate(["daily", "esports", "anime", "webid"]):

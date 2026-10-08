@@ -29,8 +29,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from model_manager import download_asr, download_silero
-from i18n import t, get_lang
+from livetranslate.models.manager import download_asr, download_silero
+from livetranslate.paths import I18N_DIR
+from livetranslate.ui.i18n import t, get_lang
 
 log = logging.getLogger("LiveTranslate.Dialogs")
 
@@ -337,7 +338,7 @@ class SetupWizardDialog(QDialog):
 
         self._append_log(f"\n{t('download_complete')}")
         hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
-        from control_panel import _save_settings
+        from livetranslate.ui.control_panel import _save_settings
 
         settings = {
             "hub": hub,
@@ -757,7 +758,7 @@ class ModelEditDialog(QDialog):
         return result
 
 
-_I18N_DIR = Path(__file__).parent / "i18n"
+_I18N_DIR = I18N_DIR
 
 
 def _changelog_to_html(text: str) -> str:
@@ -783,7 +784,7 @@ def _changelog_to_html(text: str) -> str:
 
 def _load_latest_changelog() -> tuple[str, str]:
     """Return (first_h2_title, html) for the latest changelog. Uses i18n lang."""
-    from i18n import get_lang
+    from livetranslate.ui.i18n import get_lang
     lang = get_lang()
     path = _I18N_DIR / f"CHANGELOG_{lang}.md"
     if not path.exists():

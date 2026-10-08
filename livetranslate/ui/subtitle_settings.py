@@ -28,11 +28,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from dialogs import available_screen_height, make_scroll_area
-from i18n import t, LANGUAGES
-from subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS
+from livetranslate.paths import APP_ROOT
+from livetranslate.ui.dialogs import available_screen_height, make_scroll_area
+from livetranslate.ui.i18n import t, LANGUAGES
+from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS
 
-_PROJECT_DIR = Path(__file__).parent
+_PROJECT_DIR = APP_ROOT
 
 
 class _ColorButton(QPushButton):

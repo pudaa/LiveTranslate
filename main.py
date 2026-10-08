@@ -16,7 +16,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 
-from model_manager import (
+from livetranslate.models.manager import (
     DEFAULT_FUNASR_MODEL,
     apply_cache_env,
     funasr_display_name,
@@ -32,6 +32,8 @@ from model_manager import (
     resolve_custom_whisper_model,
 )
 
+from livetranslate.paths import CONFIG_FILE, LOGS_DIR, TRANSCRIPTS_DIR
+
 # Set cache env BEFORE importing torch so TORCH_HOME is respected
 apply_cache_env()
 
@@ -40,11 +42,11 @@ import os
 # torch must be imported before PyQt6 to avoid DLL conflicts on Windows
 import torch  # noqa: F401
 
-from audio_capture import AudioCapture
-from vad_processor import VADProcessor
-from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
-from translator import Translator, RepetitionError
-from transcript_writer import TranscriptWriter
+from livetranslate.audio.capture import AudioCapture
+from livetranslate.audio.vad import VADProcessor
+from livetranslate.asr.client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
+from livetranslate.translate.translator import Translator, RepetitionError
+from livetranslate.output.transcript import TranscriptWriter
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
 from PyQt6.QtGui import (
@@ -59,27 +61,27 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtCore import QTimer, Qt
 
-from subtitle_overlay import SubtitleOverlay
-from subtitle_window import SubtitleWindow
-from log_window import LogWindow
-from control_panel import (
+from livetranslate.ui.overlay import SubtitleOverlay
+from livetranslate.ui.subtitle_window import SubtitleWindow
+from livetranslate.ui.log_window import LogWindow
+from livetranslate.ui.control_panel import (
     ControlPanel,
     SETTINGS_FILE,
     _load_saved_settings,
     _save_settings,
 )
-from dialogs import (
+from livetranslate.ui.dialogs import (
     SetupWizardDialog,
     ModelDownloadDialog,
     _ModelLoadDialog,
 )
-from i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
+from livetranslate.ui.i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
 
 _NO_PENDING = object()
 
 
 def setup_logging():
-    log_dir = Path(__file__).parent / "logs"
+    log_dir = LOGS_DIR
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / f"livetrans_{datetime.now():%Y%m%d_%H%M%S}.log"
 
@@ -150,7 +152,7 @@ def create_app_icon() -> QIcon:
 
 
 def load_config():
-    config_path = Path(__file__).parent / "config.yaml"
+    config_path = CONFIG_FILE
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -229,7 +231,7 @@ class LiveTranslateApp:
         self._asr_queue = queue.Queue(maxsize=16)
         self._tl_executor = ThreadPoolExecutor(max_workers=8)
 
-        self._transcript = TranscriptWriter(Path(__file__).parent / "transcripts")
+        self._transcript = TranscriptWriter(TRANSCRIPTS_DIR)
 
         # Memory diagnostic state
         import psutil
@@ -425,7 +427,7 @@ class LiveTranslateApp:
         worker subprocess (ASRClient); remote-whisper is a thin in-process HTTP client
         that needs no subprocess isolation (no native deps, no GPU model to load)."""
         if config.get("engine_type") == "remote-whisper":
-            from asr_remote import RemoteASREngine
+            from livetranslate.asr.backends.remote import RemoteASREngine
 
             url = config.get("remote_asr_url") or "http://127.0.0.1:8765"
             engine = RemoteASREngine(server_url=url)
@@ -456,7 +458,7 @@ class LiveTranslateApp:
         if self._panel:
             settings = self._panel.get_settings()
             settings["target_language"] = lang
-            from control_panel import _save_settings
+            from livetranslate.ui.control_panel import _save_settings
 
             _save_settings(settings)
 
@@ -1789,7 +1791,7 @@ def main():
         log.info("Setup wizard completed")
 
         # Prompt user to configure translation API
-        from dialogs import ModelEditDialog
+        from livetranslate.ui.dialogs import ModelEditDialog
 
         info = QMessageBox(
             QMessageBox.Icon.Information,
@@ -2156,7 +2158,7 @@ def main():
     def _on_tray_model_switch(index):
         models = panel.get_settings().get("models", [])
         if 0 <= index < len(models):
-            from control_panel import _save_settings
+            from livetranslate.ui.control_panel import _save_settings
 
             settings = panel.get_settings()
             settings["active_model"] = index
@@ -2169,7 +2171,7 @@ def main():
     def on_overlay_model_switch(index):
         models = panel.get_settings().get("models", [])
         if 0 <= index < len(models):
-            from control_panel import _save_settings
+            from livetranslate.ui.control_panel import _save_settings
 
             settings = panel.get_settings()
             settings["active_model"] = index
@@ -2210,7 +2212,7 @@ def main():
     def _on_tray_lang_switch(lang_code):
         overlay.set_target_language(lang_code)
         live_trans._on_target_language_changed(lang_code)
-        from control_panel import _save_settings
+        from livetranslate.ui.control_panel import _save_settings
 
         settings = panel.get_settings()
         settings["target_language"] = lang_code
@@ -2251,7 +2253,7 @@ def main():
         _asr_lang_actions[current_asr_lang].setChecked(True)
 
     def _on_tray_asr_lang(code):
-        from control_panel import _save_settings
+        from livetranslate.ui.control_panel import _save_settings
 
         live_trans._set_asr_language(code)
         settings = panel.get_settings()

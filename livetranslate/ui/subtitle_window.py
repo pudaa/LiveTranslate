@@ -30,6 +30,8 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout
 
+from livetranslate.paths import APP_ROOT
+
 # Win32 extended window style bits for OS-level mouse click-through (same
 # mechanism as the main overlay): a window with WS_EX_TRANSPARENT passes clicks
 # to whatever is behind it, so it never blocks the video player / browser.
@@ -44,7 +46,7 @@ def _resolve_image_path(path: str) -> str:
     p = Path(path)
     if p.is_absolute():
         return str(p) if p.exists() else ""
-    resolved = Path(__file__).parent / p
+    resolved = APP_ROOT / p
     return str(resolved) if resolved.exists() else ""
 
 # Default subtitle window settings

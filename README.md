@@ -113,21 +113,39 @@ Audio (WASAPI 32ms) → VAD (Silero) → ASR → LLM Translation → Overlay
 ```
 
 ```
-main.py                 Entry point & pipeline
-├── audio_capture.py    WASAPI loopback + mic mix-in
-├── vad_processor.py    Silero VAD
-├── asr_engine.py       faster-whisper backend
-├── asr_funasr.py       Unified FunASR model selector backend
-├── asr_sensevoice.py   SenseVoice backend
-├── asr_funasr_nano.py  FunASR Nano backend
-├── asr_anime_whisper.py Anime-Whisper backend (ja anime/galgame)
-├── asr_remote.py        Remote Whisper client (→ asr_server.py, see REMOTE_ASR.md)
-├── translator.py       OpenAI-compatible client (streaming, JSON schema, context)
-├── model_manager.py    Model download & cache
-├── subtitle_overlay.py PyQt6 overlay
-├── control_panel.py    Settings UI (7 tabs)
-├── dialogs.py          Wizard, download & model config dialogs
-└── benchmark.py        Translation benchmark
+main.py                    Entry point & pipeline
+livetranslate/             all code lives in the package
+├── paths.py               Central path anchors (project root, models/, logs/, ...)
+├── audio/
+│   ├── capture.py         WASAPI loopback + mic mix-in
+│   └── vad.py             Silero VAD
+├── asr/
+│   ├── client.py          Main-process worker manager (spawn + Pipe IPC)
+│   ├── worker.py          Subprocess entry point
+│   ├── server.py          Standalone HTTP ASR server (remote-whisper)
+│   └── backends/
+│       ├── whisper.py     faster-whisper backend
+│       ├── funasr.py      Unified FunASR model selector backend
+│       ├── sensevoice.py  SenseVoice backend
+│       ├── funasr_nano.py FunASR Nano backend
+│       ├── anime_whisper.py Anime-Whisper backend (ja anime/galgame)
+│       ├── remote.py      Remote Whisper client (see REMOTE_ASR.md)
+│       └── nano_src/      Vendored FunASR-Nano code
+├── translate/
+│   └── translator.py      OpenAI-compatible client (streaming, JSON schema, context)
+├── output/
+│   └── transcript.py      Per-session transcript writer
+├── ui/
+│   ├── overlay.py         PyQt6 overlay
+│   ├── subtitle_window.py Standalone subtitle window (OBS, outlined text)
+│   ├── subtitle_settings.py Subtitle window settings UI
+│   ├── control_panel.py   Settings UI (7 tabs)
+│   ├── dialogs.py         Wizard, download & model config dialogs
+│   ├── log_window.py      Real-time log viewer
+│   └── i18n.py            UI strings
+├── models/
+│   └── manager.py         Model download & cache
+└── benchmark.py           Translation benchmark
 ```
 
 ## Acknowledgements

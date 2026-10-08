@@ -1,10 +1,12 @@
 import locale
+
 import yaml
-from pathlib import Path
+
+from livetranslate.paths import I18N_DIR
 
 _strings: dict = {}
 _lang = "en"
-_dir = Path(__file__).parent / "i18n"
+_dir = I18N_DIR
 
 
 def _detect_system_lang() -> str:

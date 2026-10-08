@@ -6,17 +6,24 @@ __pycache__/
 .pip-cache/
 .uv-cache/
 .tmp/
-models/
-logs/
-docs/
-transcripts/
-user_settings.json
+
+# Runtime data -- anchored to the project root with a leading slash on purpose.
+# An unanchored "models/" would also match livetranslate/models/, silently
+# dropping the model-manager *code package* from every commit.
+/models/
+/logs/
+/docs/
+/transcripts/
+/user_settings.json
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Agent tooling state (workspace memory, etc.)
+.workbuddy/
 
 # OS
 Thumbs.db

@@ -3,6 +3,8 @@ import contextlib
 import logging
 from pathlib import Path
 
+from livetranslate.paths import APP_ROOT, MODELS_DIR
+
 log = logging.getLogger("LiveTranslate.ModelManager")
 
 _PROXY_ENV_KEYS = (
@@ -62,8 +64,10 @@ def _proxy_env(proxy: str):
             os.environ["NO_PROXY"] = saved_no_proxy
         urllib.request.install_opener(saved_opener)
 
-APP_DIR = Path(__file__).parent
-MODELS_DIR = APP_DIR / "models"
+# Runtime data lives at the project root; see livetranslate/paths.py.
+# APP_DIR is kept as a backwards-compatible alias: relative custom-whisper
+# paths resolve against it (see resolve_custom_whisper_model).
+APP_DIR = APP_ROOT
 
 ASR_MODEL_IDS = {
     "sensevoice": "iic/SenseVoiceSmall",

@@ -114,19 +114,37 @@ Audio (WASAPI 32ms) → VAD (Silero) → ASR → LLM Translation → Overlay
 
 ```
 main.py                 主入口，管线编排
-├── audio_capture.py    WASAPI loopback + 麦克风混音
-├── vad_processor.py    Silero VAD
-├── asr_engine.py       faster-whisper 后端
-├── asr_funasr.py       统一 FunASR 模型选择后端
-├── asr_sensevoice.py   SenseVoice 后端
-├── asr_funasr_nano.py  FunASR Nano 后端
-├── asr_anime_whisper.py Anime-Whisper 后端 (日语动画/Galgame)
-├── asr_remote.py        远程 Whisper 客户端 (→ asr_server.py, 见 REMOTE_ASR.md)
-├── translator.py       OpenAI 兼容翻译客户端 (流式/JSON/上下文)
-├── model_manager.py    模型下载与缓存管理
-├── subtitle_overlay.py PyQt6 透明悬浮窗
-├── control_panel.py    设置面板 UI (7 个标签页)
-├── dialogs.py          设置向导、下载、模型配置对话框
+livetranslate/          所有代码都在这个包内
+├── paths.py            统一路径锚点（项目根 / models / logs ...）
+├── audio/
+│   ├── capture.py      WASAPI loopback + 麦克风混音
+│   └── vad.py          Silero VAD
+├── asr/
+│   ├── client.py       主进程 worker 管理（spawn + Pipe IPC）
+│   ├── worker.py       子进程入口
+│   ├── server.py       独立 HTTP ASR 服务（远程 Whisper 用）
+│   └── backends/
+│       ├── whisper.py      faster-whisper 后端
+│       ├── funasr.py       统一 FunASR 模型选择后端
+│       ├── sensevoice.py   SenseVoice 后端
+│       ├── funasr_nano.py  FunASR Nano 后端
+│       ├── anime_whisper.py Anime-Whisper 后端 (日语动画/Galgame)
+│       ├── remote.py       远程 Whisper 客户端（见 REMOTE_ASR.md）
+│       └── nano_src/       内置的 FunASR-Nano 代码
+├── translate/
+│   └── translator.py   OpenAI 兼容翻译客户端 (流式/JSON/上下文)
+├── output/
+│   └── transcript.py   转录落盘
+├── ui/
+│   ├── overlay.py          PyQt6 透明悬浮窗
+│   ├── subtitle_window.py  独立字幕窗（OBS 用，描边文字）
+│   ├── subtitle_settings.py 字幕窗设置 UI
+│   ├── control_panel.py    设置面板 UI (7 个标签页)
+│   ├── dialogs.py          设置向导、下载、模型配置对话框
+│   ├── log_window.py       实时日志窗
+│   └── i18n.py             界面文案
+├── models/
+│   └── manager.py      模型下载与缓存管理
 └── benchmark.py        翻译基准测试
 ```
 

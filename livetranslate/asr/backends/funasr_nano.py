@@ -10,7 +10,7 @@ import torch
 log = logging.getLogger("LiveTranslate.FunASR-Nano")
 
 # Add bundled code to path so model.py can resolve its imports (ctc, tools.utils)
-_NANO_DIR = os.path.join(os.path.dirname(__file__), "funasr_nano")
+_NANO_DIR = os.path.join(os.path.dirname(__file__), "nano_src")
 
 
 class FunASRNanoEngine:
@@ -24,7 +24,7 @@ class FunASRNanoEngine:
         import model as _nano_model  # noqa: F401
 
         from funasr import AutoModel
-        from model_manager import (
+        from livetranslate.models.manager import (
             ASR_MODEL_IDS,
             ensure_qwen_weights,
             get_local_model_path,
