@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
@@ -51,6 +52,7 @@ from livetranslate.models.manager import (
 )
 from livetranslate.paths import SETTINGS_FILE, TRANSCRIPTS_DIR
 from livetranslate.ui.i18n import t, LANGUAGES
+from livetranslate.ui.styles import CINEMA_OVERLAY_ITEMS
 from livetranslate.ui.subtitle_settings import SubtitleSettingsWidget
 
 log = logging.getLogger("LiveTranslate.Panel")
@@ -636,6 +638,9 @@ class ControlPanel(QWidget):
         preset_layout = QHBoxLayout(preset_group)
         self._style_preset = QComboBox()
         preset_names = [
+            # Cinema / native-subtitle presets first -- they are the point of the
+            # feature, and they also switch on pure mode (metadata off).
+            *[(key, t(label)) for key, label in CINEMA_OVERLAY_ITEMS],
             ("default", t("preset_default")),
             ("transparent", t("preset_transparent")),
             ("compact", t("preset_compact")),
@@ -659,9 +664,17 @@ class ControlPanel(QWidget):
         if current_preset in self._preset_keys:
             self._style_preset.setCurrentIndex(self._preset_keys.index(current_preset))
         else:
-            self._style_preset.setCurrentIndex(5)  # custom
+            # not a known preset -> Custom (always the last entry)
+            self._style_preset.setCurrentIndex(len(self._preset_keys) - 1)
         self._style_preset.currentIndexChanged.connect(self._on_preset_changed)
         preset_layout.addWidget(self._style_preset, 1)
+        # Pure mode drops the per-line metadata (timestamp / language / ASR + TL
+        # timing) so the overlay reads like native subtitles. Cinema presets turn
+        # it on; the terminal presets leave it off.
+        self._pure_mode = QCheckBox(t("style_pure_mode"))
+        self._pure_mode.setChecked(not s.get("show_meta", True))
+        self._pure_mode.toggled.connect(self._on_style_value_changed)
+        preset_layout.addWidget(self._pure_mode)
         reset_btn = QPushButton(t("btn_reset_style"))
         reset_btn.clicked.connect(self._reset_style)
         preset_layout.addWidget(reset_btn)
@@ -857,6 +870,7 @@ class ControlPanel(QWidget):
             "translation_color": self._trans_color_btn.property("hex_color"),
             "timestamp_color": self._ts_color_btn.property("hex_color"),
             "window_opacity": self._window_opacity.value(),
+            "show_meta": not self._pure_mode.isChecked(),
         }
 
     def _apply_style_to_controls(self, s: dict):
@@ -889,16 +903,20 @@ class ControlPanel(QWidget):
             f"background-color: {s['timestamp_color']}; border: 1px solid #888; border-radius: 3px;"
         )
         self._window_opacity.setValue(s["window_opacity"])
+        self._pure_mode.setChecked(not s.get("show_meta", True))
 
     def _on_preset_changed(self, index):
-        from livetranslate.ui.overlay import STYLE_PRESETS
+        from livetranslate.ui.overlay import DEFAULT_STYLE, STYLE_PRESETS
 
         key = self._preset_keys[index]
         if key == "custom":
             return
-        preset = STYLE_PRESETS.get(key)
-        if not preset:
+        raw = STYLE_PRESETS.get(key)
+        if not raw:
             return
+        # Merge onto DEFAULT_STYLE: a preset only names the fields it cares about,
+        # and _apply_style_to_controls indexes the dict directly.
+        preset = {**DEFAULT_STYLE, **raw}
         self._block_style_signals(True)
         self._apply_style_to_controls(preset)
         self._block_style_signals(False)
@@ -934,6 +952,7 @@ class ControlPanel(QWidget):
             self._orig_font_size,
             self._trans_font_size,
             self._window_opacity,
+            self._pure_mode,
         ):
             w.blockSignals(block)
 

@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 from livetranslate.paths import APP_ROOT
 from livetranslate.ui.dialogs import available_screen_height, make_scroll_area
 from livetranslate.ui.i18n import t, LANGUAGES
+from livetranslate.ui.styles import CINEMA_SUBWIN_ITEMS, CINEMA_SUBWIN_PRESETS
 from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS
 
 _PROJECT_DIR = APP_ROOT
@@ -350,6 +351,22 @@ class SubtitleSettingsWidget(QWidget):
         g.setColumnMinimumWidth(1, 180)
         r = 0
 
+        # Cinema style preset: applies a whole look (background plate + both text
+        # lines) in one click, so the window can reproduce a native player's
+        # subtitles instead of being styled field by field. The presets live in
+        # livetranslate/ui/styles.py.
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel(t("subwin_preset")))
+        self._preset_combo = QComboBox()
+        for key, label_key in CINEMA_SUBWIN_ITEMS:
+            self._preset_combo.addItem(t(label_key), key)
+        self._preset_combo.addItem(t("subwin_preset_custom"), "custom")
+        self._preset_combo.setCurrentIndex(len(CINEMA_SUBWIN_ITEMS))  # custom
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        preset_row.addWidget(self._preset_combo, 1)
+        g.addLayout(preset_row, r, 0, 1, 2)
+        r += 1
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         reset_btn = QPushButton(t("subwin_reset"))
@@ -482,6 +499,15 @@ class SubtitleSettingsWidget(QWidget):
         lines_layout.addLayout(btn_row)
 
         layout.addWidget(lines_group)
+
+    def _on_preset_changed(self, index):
+        """Apply a cinema style preset to the whole window at once."""
+        key = self._preset_combo.itemData(index)
+        if not key or key == "custom" or key not in CINEMA_SUBWIN_PRESETS:
+            return
+        self._settings = {**self._settings, **CINEMA_SUBWIN_PRESETS[key]}
+        self.update_settings(self._settings)
+        self._emit_settings()
 
     def _on_reset(self):
         ret = QMessageBox.question(

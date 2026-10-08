@@ -3,6 +3,7 @@ import os
 
 import psutil
 from livetranslate.ui.i18n import t, LANGUAGES
+from livetranslate.ui.styles import CINEMA_OVERLAY_PRESETS
 from PyQt6.QtCore import QPoint, QPropertyAnimation, QEasingCurve, QSize, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QCursor, QFont
 from PyQt6.QtWidgets import (
@@ -41,6 +42,10 @@ DEFAULT_STYLE = {
     "translation_color": "#ffffff",
     "timestamp_color": "#888899",
     "window_opacity": 95,
+    # When False the per-line metadata (timestamp / language / ASR + TL timing)
+    # is dropped, so the overlay reads like native subtitles. Cinema presets in
+    # styles.py turn this off; the terminal presets keep it on.
+    "show_meta": True,
 }
 
 _BASE = DEFAULT_STYLE
@@ -183,6 +188,11 @@ STYLE_PRESETS = {
     },
 }
 
+# Cinema / native-subtitle presets are defined in styles.py next to their
+# subtitle-window counterparts; merged in so the style tab can enumerate one
+# list. They additionally switch off the metadata chrome.
+STYLE_PRESETS.update(CINEMA_OVERLAY_PRESETS)
+
 
 def _hex_to_rgba(hex_color: str, opacity: int) -> str:
     hex_color = hex_color.lstrip("#")
@@ -239,6 +249,12 @@ class ChatMessage(QWidget):
         self._layout.addWidget(self._trans_label)
 
     def _build_header_html(self, s):
+        if not _meta_enabled(s):
+            # Pure mode: text only, no timestamp / language / timing chrome.
+            return (
+                f'<span style="color:{s["original_color"]};">'
+                f"{_escape(self._original)}</span>"
+            )
         if self._compact_mode:
             return (
                 f'<span style="color:#6cf;">[{self._source_lang}]</span> '
@@ -282,7 +298,7 @@ class ChatMessage(QWidget):
             self._pending_streaming = None
         s = self._current_style
         if translated:
-            if self._compact_mode:
+            if self._compact_mode or not _meta_enabled(s):
                 self._trans_label.setText(
                     f'<span style="color:{s["translation_color"]};">&gt; {_escape(translated)}</span>'
                 )
@@ -312,7 +328,7 @@ class ChatMessage(QWidget):
             QFont(s["translation_font_family"], s["translation_font_size"])
         )
         if self._translated:
-            if self._compact_mode:
+            if self._compact_mode or not _meta_enabled(s):
                 self._trans_label.setText(
                     f'<span style="color:{s["translation_color"]};">&gt; {_escape(self._translated)}</span>'
                 )
@@ -359,6 +375,11 @@ class ChatMessage(QWidget):
 
 def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _meta_enabled(style: dict) -> bool:
+    """Whether the per-line metadata chrome (timestamp / language / timing) shows."""
+    return bool(style.get("show_meta", True))
 
 
 _BTN_CSS = """

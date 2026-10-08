@@ -27,6 +27,12 @@ sentencepiece>=0.2.0
 tiktoken>=0.7.0
 transformers>=4.40.0
 
+# Sentence segmentation for incremental ASR (main.py -> _get_segmenter).
+# Upstream omitted this from requirements.txt, so a fresh install crashed with
+# ModuleNotFoundError: No module named 'yasbd' the first time incremental ASR
+# tried to split a sentence.
+yasbd-lib>=1.0.0
+
 # VAD (bundles the Silero v5 model in the wheel — no GitHub/torch.hub download)
 silero-vad>=5.0
 

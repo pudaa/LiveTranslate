@@ -467,7 +467,6 @@ pip install -r requirements.txt
 ---
 
 ## 附：调研证据索引
-
 | 结论 | 证据位置 |
 |---|---|
 | ASR 引擎 if/elif 分发 | `asr_worker.py:54-102` |
@@ -487,3 +486,57 @@ pip install -r requirements.txt
 | 设备级选择已有 | `audio_capture.py:13-56`、`:233-241` |
 | executor 已正确释放 | `main.py:1222` |
 | worker RSS 回收 | `main.py:977-1042` |
+
+---
+
+## 10. 实施进展与落地决策
+
+### 10.1 老大已拍板
+
+1. **音频源过滤走 A+B**（会话枚举 + 设备隔离），不做 C（原生 WASAPI Process Loopback）。
+   A+B **在音频链路上零新增延迟**——会话枚举只在打开选择器时调用，设备隔离靠系统路由。
+2. **重构先搬目录、后拆文件**。`main.py`(94KB) / `control_panel.py`(65KB) 本轮只改 import 与路径锚点，内部结构不动。
+3. **电影字幕是立项重点，必做**。
+4. 环境用 **conda 独立 env**，不污染全局/base。
+
+### 10.2 与原方案的两处偏离（实施中发现的更优解）
+
+**① 翻译只做两档，不做三档。**
+原方案提 `captions` / `translate` / `bilingual`。落地时发现 **`bilingual` 是冗余的**：overlay 本来就同时渲染原文与译文（`ChatMessage` 头部=原文，下方=译文），subtitle window 也接收 `(original, translations)` 两者。也就是说"双语"**已经是上游行为**，再开一个与 `translate` 完全等价的模式属于为了对称而对称。
+
+真正的解耦只有一件事：**要不要调翻译**。所以落地为 `captions` / `translate` 两档 + overlay 的「纯净模式」显示开关（与模式正交的另一根轴）。
+
+**② 电影字幕同时落在两套载体上。**
+- **overlay**：4 个影院配色预设 + **纯净模式**（去掉时间戳/语言/ASR-TL 耗时那套"调试味"信息）。overlay 用 QLabel 渲染富文本，**画不了描边**，所以它的"电影感"来自低视觉噪音。
+- **subtitle_window**：4 个影院预设，含**真·描边**（`QPainterPath` 逐行描边）——`cinema_outline` 透明底 + 白字黑描边 3px 才是"最接近原生播放器"的那一个。
+
+### 10.3 实施中发现的三个真实缺陷（均已修）
+
+| # | 缺陷 | 影响 | 处置 |
+|---|---|---|---|
+| 1 | **`.gitignore` 的 `models/` 未锚定根目录** | 它同时匹配 `livetranslate/models/`，会把 model-manager **代码包整个排除在提交之外**——静默丢失，代码直接废掉 | 运行时数据目录全部加前导 `/` 锚定 |
+| 2 | **`requirements.txt` 漏了 `yasbd-lib`** | `main.py:_get_segmenter()` 依赖它做增量 ASR 断句。按 README 全新安装后，一进断句就 `ModuleNotFoundError` | 补进 requirements |
+| 3 | **PyPI 的 Windows torch 是 CPU 版**（实测 106MB） | 想走国内镜像加速 CUDA 版是走不通的；CUDA 只能从 `download.pytorch.org` 拿（2.4GB，国际线路 0.1–0.8 MB/s） | 部署脚本优先用 `.pip-cache/wheels/` 里的本地 wheel |
+
+### 10.4 验证体系（可复跑）
+
+| 脚本 | 覆盖 | 当前结果 |
+|---|---|---|
+| `doc/migrations/verify_p1.py` | 包内导入是否全部解析（含子模块导入、被导入名是否真的定义） | 93 处 / 45 文件，0 问题 |
+| `doc/migrations/verify_runtime.py` | 全模块导入、路径锚点、注册表懒加载不拉 torch、**ASR worker 真跑一次 spawn 往返**、模式归一化、影院预设接线 | 7/7 通过 |
+| `doc/migrations/verify_ui.py` | 离屏 Qt：控制面板预设联动、字幕窗预设端到端、overlay 纯净模式与 captions 渲染 | 5/5 通过 |
+| `pytest tests/` | 上游自带测试 | 33 通过 |
+| `doc/migrations/prefetch_models.py` | 无需点 GUI 向导即可预下模型 | SenseVoiceSmall 897MB（ModelScope 峰值 23 MB/s） |
+
+> **踩坑记录**：GUI 校验里 `QApplication` 若只作为函数局部变量持有，PyQt6 会回收 Python 包装对象并连带销毁底层 C++ application，之后创建任何控件都会**原生崩溃且无 traceback**（表现为 exit 127）。必须用模块级全局持有。
+
+### 10.5 阶段状态
+
+| 阶段 | 状态 |
+|---|---|
+| P0 conda 环境 | ✅ env `livetranslate`（Python 3.12）；CPU torch 2.14.1 已装并跑通全部验证；**CUDA wheel 待老大下载后换上** |
+| P1 搬目录 | ✅ 提交 `5715bcb` |
+| P2 解耦 | ✅ 提交 `337abbe` |
+| P3 电影字幕 | ✅ 代码与验证完成 |
+| P4 优化 | ⏳ SRT 导出 / 内存修复 / 音频源过滤 A+B |
+
