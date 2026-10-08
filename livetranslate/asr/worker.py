@@ -7,6 +7,8 @@ from typing import Any
 
 import numpy as np
 
+from livetranslate.asr import registry
+
 log = logging.getLogger("LiveTranslate.ASRWorker")
 
 
@@ -43,60 +45,20 @@ def _ok_response(msg_id: str | None, response_type: str, payload: Any = None) ->
     }
 
 
-def _parse_device(device: str) -> tuple[str, int]:
-    device = str(device or "cpu").split(" (", 1)[0].strip()
-    if device.startswith("cuda:"):
-        index = int(device.split(":", 1)[1])
-        return "cuda", index
-    return device, 0
-
-
 def _load_engine(config: dict):
-    from livetranslate.models.manager import MODELS_DIR, apply_cache_env
+    """Instantiate the configured backend inside this worker process.
 
+    Resolution goes through ``livetranslate.asr.registry``, which imports only
+    the requested backend module -- see that module for the engine contract and
+    for how to add a new backend.
+    """
+    from livetranslate.models.manager import apply_cache_env
+
+    # Must run before the backend imports torch, so TORCH_HOME is respected.
     apply_cache_env()
 
-    engine_type = config["engine_type"]
-    device = config.get("device", "cpu")
-    hub = config.get("hub", "ms")
+    engine = registry.build(config.get("engine_type"), config)
     language = config.get("language", "auto")
-    pad_seconds = config.get("pad_seconds")
-
-    parsed_device, device_index = _parse_device(device)
-
-    if engine_type == "funasr":
-        from livetranslate.asr.backends.funasr import FunASREngine
-
-        engine = FunASREngine(
-            model_key=config.get("funasr_model"),
-            device=device,
-            hub=hub,
-            pad_seconds=pad_seconds,
-        )
-    elif engine_type == "anime-whisper":
-        from livetranslate.asr.backends.anime_whisper import AnimeWhisperEngine
-
-        worker_device = parsed_device if parsed_device == "cpu" else f"cuda:{device_index}"
-        engine = AnimeWhisperEngine(device=worker_device, hub=hub)
-    else:
-        from livetranslate.asr.backends.whisper import ASREngine
-
-        compute_type = config.get("compute_type", "float16")
-        if parsed_device == "cpu" and compute_type == "float16":
-            compute_type = "int8"
-        download_root = config.get("download_root")
-        if not download_root:
-            download_root = str((MODELS_DIR / "huggingface" / "hub").resolve())
-        engine = ASREngine(
-            model_size=config["model_size"],
-            device=parsed_device,
-            device_index=device_index,
-            compute_type=compute_type,
-            language=language,
-            download_root=download_root,
-            pad_seconds=pad_seconds,
-        )
-
     if hasattr(engine, "set_language"):
         engine.set_language(language)
     return engine

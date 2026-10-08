@@ -296,6 +296,13 @@ class ChatMessage(QWidget):
                 f'<span style="color:#aaa; font-style:italic;">&gt; {t("same_language")}</span>'
             )
 
+    def hide_translation(self):
+        """Drop the translation line entirely (captions mode -- there is none)."""
+        if hasattr(self, "_streaming_timer"):
+            self._streaming_timer.stop()
+        self._pending_streaming = None
+        self._trans_label.hide()
+
     def apply_style(self, s: dict):
         self._header_label.setText(self._build_header_html(s))
         self._header_label.setFont(
@@ -890,6 +897,8 @@ class SubtitleOverlay(QWidget):
     update_monitor_signal = pyqtSignal(float, float, object)
     update_stats_signal = pyqtSignal(int, int, int, int, float)
     update_asr_device_signal = pyqtSignal(str)
+    # captions mode: this message has no translation, so drop the line entirely
+    captions_only_signal = pyqtSignal(int)
 
     settings_requested = pyqtSignal()
     target_language_changed = pyqtSignal(str)
@@ -921,6 +930,7 @@ class SubtitleOverlay(QWidget):
         self.add_message_signal.connect(self._on_add_message)
         self.update_translation_signal.connect(self._on_update_translation)
         self.update_streaming_signal.connect(self._on_update_streaming)
+        self.captions_only_signal.connect(self._on_captions_only)
         self.clear_signal.connect(self._on_clear)
         self.update_monitor_signal.connect(self._on_update_monitor)
         self.update_stats_signal.connect(self._on_update_stats)
@@ -1170,6 +1180,12 @@ class SubtitleOverlay(QWidget):
         if msg:
             msg.update_streaming(partial_text)
 
+    @pyqtSlot(int)
+    def _on_captions_only(self, msg_id):
+        msg = self._messages.get(msg_id)
+        if msg:
+            msg.hide_translation()
+
     @pyqtSlot()
     def _on_clear(self):
         for msg in self._messages.values():
@@ -1261,6 +1277,12 @@ class SubtitleOverlay(QWidget):
 
     def update_streaming(self, msg_id, partial_text):
         self.update_streaming_signal.emit(msg_id, partial_text)
+
+    def mark_captions_only(self, msg_id):
+        """Captions mode: show the ASR text as the subtitle, with no translation
+        line at all (passing an empty translation would render the "same
+        language" placeholder, which would be misleading)."""
+        self.captions_only_signal.emit(msg_id)
 
     def update_monitor(self, rms, vad_conf, mic_rms=None):
         self.update_monitor_signal.emit(rms, vad_conf, mic_rms)

@@ -62,3 +62,13 @@ class FunASREngine:
 
     def transcribe(self, audio: np.ndarray) -> dict | None:
         return self._engine.transcribe(audio)
+
+
+def build_engine(config: dict) -> FunASREngine:
+    """Factory for livetranslate.asr.registry."""
+    return FunASREngine(
+        model_key=config.get("funasr_model"),
+        device=config.get("device", "cuda"),
+        hub=config.get("hub", "ms"),
+        pad_seconds=config.get("pad_seconds"),
+    )

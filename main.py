@@ -46,6 +46,7 @@ from livetranslate.audio.capture import AudioCapture
 from livetranslate.audio.vad import VADProcessor
 from livetranslate.asr.client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
 from livetranslate.translate.translator import Translator, RepetitionError
+from livetranslate.translate.modes import CAPTIONS, normalize as normalize_pipeline_mode
 from livetranslate.output.transcript import TranscriptWriter
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
@@ -210,6 +211,12 @@ class LiveTranslateApp:
         self._asr_worker_baseline_mb = None
         self._asr_recycle_delta_mb = 2048
         self._target_language = config["translation"]["target_language"]
+        # Pipeline mode governs whether the translator runs at all -- see
+        # livetranslate/translate/modes.py. Kept in config.yaml so a captions-only
+        # setup needs no settings file and no translation endpoint.
+        self._pipeline_mode = normalize_pipeline_mode(
+            (config.get("pipeline") or {}).get("mode")
+        )
         self._translator = Translator(
             api_base=config["translation"]["api_base"],
             api_key=config["translation"]["api_key"],
@@ -327,6 +334,11 @@ class LiveTranslateApp:
             self._target_language = settings["target_language"]
             if self._overlay:
                 self._overlay.set_target_language(self._target_language)
+        if "pipeline_mode" in settings:
+            new_mode = normalize_pipeline_mode(settings["pipeline_mode"])
+            if new_mode != self._pipeline_mode:
+                log.info(f"Pipeline mode: {self._pipeline_mode} -> {new_mode}")
+                self._pipeline_mode = new_mode
         if "timeout" in settings and self._translator:
             self._translator.set_timeout(settings["timeout"])
         if "auto_save_transcript" in settings:
@@ -1312,46 +1324,7 @@ class LiveTranslateApp:
         self._last_original = original_text
         self._last_msg_id = msg_id
 
-        target_lang = self._target_language
-
-        # Collect extra languages needed by subtitle window (beyond the primary target)
-        extra_langs = set()
-        if self._subwin and self._subwin.isVisible():
-            subwin_langs = self._subwin.get_target_languages()
-            # Remove primary target and source (no need to translate those)
-            extra_langs = subwin_langs - {target_lang, source_lang}
-
-        if source_lang == target_lang:
-            log.info(f"Same language ({source_lang}), no translation")
-            self._transcript.finalize_no_translation(msg_id)
-            if self._overlay:
-                self._overlay.update_translation(msg_id, "", 0)
-                self._overlay.update_stats(
-                    self._asr_count,
-                    self._translate_count,
-                    self._total_prompt_tokens,
-                    self._total_completion_tokens,
-                    self._compute_cost(),
-                )
-            if self._subwin and self._subwin.isVisible():
-                # Primary is same language; still need to translate extra langs
-                if extra_langs:
-                    try:
-                        self._tl_executor.submit(
-                            self._translate_subwin_only, original_text, source_lang, extra_langs
-                        )
-                    except RuntimeError:
-                        pass
-                else:
-                    self._subwin.update_text(original_text, {target_lang: original_text})
-        else:
-            try:
-                self._tl_executor.submit(
-                    self._translate_async, msg_id, original_text, source_lang,
-                    extra_langs or None,
-                )
-            except RuntimeError:
-                log.warning("Translation executor shut down, skipping")
+        self._dispatch_output(msg_id, original_text, source_lang)
 
     # ── Incremental ASR ──
 
@@ -1552,10 +1525,42 @@ class LiveTranslateApp:
         self._last_original = original_text
         self._last_msg_id = msg_id
 
+        self._dispatch_output(msg_id, original_text, source_lang)
+
+    def _dispatch_output(self, msg_id, text, source_lang):
+        """Route a recognized text result to the overlay and subtitle window.
+
+        The whole-segment path (``_process_segment``) and the incremental path
+        (``_process_segment_text``) both funnel through here, so the two can
+        never drift apart again -- upstream carried two near-identical copies of
+        this block.
+
+        ``captions`` mode stops here: the ASR text *is* the subtitle, so the
+        translator is never invoked (no API key, no network, no latency).
+        ``translate`` mode is upstream behaviour.
+        """
         target_lang = self._target_language
+
+        if self._pipeline_mode == CAPTIONS:
+            self._transcript.finalize_no_translation(msg_id)
+            if self._overlay:
+                self._overlay.mark_captions_only(msg_id)
+                self._overlay.update_stats(
+                    self._asr_count,
+                    self._translate_count,
+                    self._total_prompt_tokens,
+                    self._total_completion_tokens,
+                    self._compute_cost(),
+                )
+            if self._subwin and self._subwin.isVisible():
+                self._subwin.update_text(text, {target_lang: text})
+            return
+
+        # Collect extra languages needed by subtitle window (beyond the primary target)
         extra_langs = set()
         if self._subwin and self._subwin.isVisible():
             subwin_langs = self._subwin.get_target_languages()
+            # Remove primary target and source (no need to translate those)
             extra_langs = subwin_langs - {target_lang, source_lang}
 
         if source_lang == target_lang:
@@ -1563,18 +1568,30 @@ class LiveTranslateApp:
             self._transcript.finalize_no_translation(msg_id)
             if self._overlay:
                 self._overlay.update_translation(msg_id, "", 0)
-                self._overlay.update_stats(self._asr_count, self._translate_count, self._total_prompt_tokens, self._total_completion_tokens, self._compute_cost())
+                self._overlay.update_stats(
+                    self._asr_count,
+                    self._translate_count,
+                    self._total_prompt_tokens,
+                    self._total_completion_tokens,
+                    self._compute_cost(),
+                )
             if self._subwin and self._subwin.isVisible():
+                # Primary is same language; still need to translate extra langs
                 if extra_langs:
                     try:
-                        self._tl_executor.submit(self._translate_subwin_only, original_text, source_lang, extra_langs)
+                        self._tl_executor.submit(
+                            self._translate_subwin_only, text, source_lang, extra_langs
+                        )
                     except RuntimeError:
                         pass
                 else:
-                    self._subwin.update_text(original_text, {target_lang: original_text})
+                    self._subwin.update_text(text, {target_lang: text})
         else:
             try:
-                self._tl_executor.submit(self._translate_async, msg_id, original_text, source_lang, extra_langs or None)
+                self._tl_executor.submit(
+                    self._translate_async, msg_id, text, source_lang,
+                    extra_langs or None,
+                )
             except RuntimeError:
                 log.warning("Translation executor shut down, skipping")
     def _process_interim_final(self, speech_segment):

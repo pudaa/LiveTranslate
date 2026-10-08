@@ -1,5 +1,14 @@
 # LiveTrans Configuration
 
+pipeline:
+  # How far an ASR result travels.
+  #   captions  - the ASR text IS the subtitle: never translate, so no API key,
+  #               no network and no translation latency. Use this to watch a
+  #               video silently in a language you already read.
+  #   translate - translate the ASR text into the target language (upstream
+  #               behaviour; the overlay shows original + translation).
+  mode: "translate"
+
 audio:
   # WASAPI loopback device name (null = default output device)
   device: null

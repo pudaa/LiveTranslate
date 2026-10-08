@@ -155,3 +155,27 @@ class ASREngine:
         if word_timestamps and words:
             result["words"] = words
         return result
+
+
+def build_engine(config: dict) -> ASREngine:
+    """Factory for livetranslate.asr.registry."""
+    from livetranslate.asr.registry import parse_device
+    from livetranslate.paths import MODELS_DIR
+
+    device, device_index = parse_device(config.get("device", "cpu"))
+    compute_type = config.get("compute_type", "float16")
+    if device == "cpu" and compute_type == "float16":
+        # float16 is a CUDA-only compute type; ctranslate2 rejects it on CPU
+        compute_type = "int8"
+    download_root = config.get("download_root")
+    if not download_root:
+        download_root = str((MODELS_DIR / "huggingface" / "hub").resolve())
+    return ASREngine(
+        model_size=config["model_size"],
+        device=device,
+        device_index=device_index,
+        compute_type=compute_type,
+        language=config.get("language", "auto"),
+        download_root=download_root,
+        pad_seconds=config.get("pad_seconds"),
+    )

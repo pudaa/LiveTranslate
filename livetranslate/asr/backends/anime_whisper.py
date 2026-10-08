@@ -99,3 +99,12 @@ class AnimeWhisperEngine:
             "language": "ja",
             "language_name": "ja",
         }
+
+
+def build_engine(config: dict) -> AnimeWhisperEngine:
+    """Factory for livetranslate.asr.registry."""
+    from livetranslate.asr.registry import parse_device
+
+    device, device_index = parse_device(config.get("device", "cuda"))
+    worker_device = device if device == "cpu" else f"cuda:{device_index}"
+    return AnimeWhisperEngine(device=worker_device, hub=config.get("hub", "ms"))

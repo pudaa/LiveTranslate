@@ -120,11 +120,16 @@ def main() -> int:
                     continue
                 if "*" in names:
                     continue
-                if a.name not in names:
-                    errors.append(
-                        f"{rel}:{node.lineno} '{a.name}' not defined in {mod} "
-                        f"({target.relative_to(ROOT)})"
-                    )
+                if a.name in names:
+                    continue
+                # `from <pkg> import <submodule>` binds a child module, which is
+                # not a name defined in the package's __init__.py.
+                if module_file(f"{mod}.{a.name}") is not None:
+                    continue
+                errors.append(
+                    f"{rel}:{node.lineno} '{a.name}' not defined in {mod} "
+                    f"({target.relative_to(ROOT)})"
+                )
 
     print(f"checked {checked} livetranslate imports across {len(targets)} files")
     if errors:
