@@ -578,6 +578,38 @@ pip install -r requirements.txt
 
 **新增**：`livetranslate/audio/sessions.py`（`SessionMonitor` / `diagnose()`）、控制面板「音频源」组、`tests/test_audio_sessions.py`（23 个用例，覆盖两种设备名方言的匹配、会话标签、峰值阈值、诊断三态）、`requirements.txt += pycaw`。
 
+### 10.11 ⏸ C（进程级 loopback）—— 调查到"激活被统一拒绝"为止，未通过
+
+**目标**：不依赖第二个输出设备，直接按 PID 抓单个进程的音频。
+
+**已确认可行/已排除的（都是实测，不是推断）**
+
+| 项 | 结论 |
+|---|---|
+| Windows 版本门槛 | ✅ build 26300 ≫ 19041，支持 |
+| `ActivateAudioInterfaceAsync` 可解析 | ✅ 从 `mmdevapi` 拿得到 |
+| pycaw 提供什么 | `IAudioClient` / `WAVEFORMATEX` 有；**`IAudioCaptureClient`、异步激活接口、激活参数结构都没有** → 需自己用 comtypes/ctypes 定义 |
+| COM apartment | 已排除。`CoGetApartmentType` 确认过 STA 与 MTA 两种状态都试过；**comtypes 导入时会把线程钉成 MAIN_STA**（MTA 线程上它直接拒绝导入），已用 `sys.coinit_flags = 0` 绕开 |
+| 完成回调对象（FTM-agile） | 已排除。自己用原生 ctypes 手搭了 COM 对象（vtable + 引用计数 + `CoCreateFreeThreadedMarshaler`），**自查 QI 全部正确**（IUnknown / ICompletionHandler / IMarshal 均返回 S_OK，bogus IID 正确返回 E_NOINTERFACE）。**过程中抓到自己一个真 bug**：`ctypes.Structure` 不按值比较，`left.contents == right` 恒为 False → 导致所有 QI 都返回 E_NOINTERFACE。改成原始字节比较后修复 |
+| 参数 | 已排除。传 NULL 参数结果一致 |
+| 设备路径 | 已排除。真实渲染端点 与 `VAD\Process_Loopback` 结果一致 |
+| riid | 已排除。`IAudioClient` / `IAudioEndpointVolume`（文档列为"显式安全"）/ `ISimpleAudioVolume` / `IAudioCaptureClient` **全部同样失败** |
+| **WorkBuddy 沙箱** | 已排除。**关掉沙箱跑，结果完全相同** |
+
+**结论**：`ActivateAudioInterfaceAsync` 在这台机器上对**任何**参数组合都返回 `E_ILLEGAL_METHOD_CALL (0x8000000E)`。官方文档把该错误解释为"错误的 apartment"或"handler 未实现为 agile 对象"，且注明**只适用于 Windows 10 之前**——而这两个原因我都已实测排除。
+
+**下一步的分岔**（需要老大定，不是我能靠读代码继续推的）：
+1. **用 MS 的 `ApplicationLoopback` C 示例做对照**。同一台机器上如果 C 版也失败 → 是这台机器/这个 build 的问题；如果 C 版成功 → 是我 ctypes 边界某处不对（但需要 C 编译器，且我已逐项排除了能想到的边界差异）
+2. **走 B**（接第二个输出端点 或 装 VB-CABLE）。已实现且无 COM 风险，**建议优先**
+3. 暂缓 C
+
+**保留的调查脚本**（可复跑）：
+- `probe_audio_source.py` —— A/B/C 三项可行性与设备枚举
+- `probe_com_apartment.py` —— apartment 状态与两种线程对比
+- `probe_activation_args.py` —— 参数级二分（含"handler 传 NULL 得 E_INVALIDARG"这一关键证据）
+- `probe_agile_handler.py` —— 原生 ctypes 的 FTM-agile 完成回调（**这个实现本身是正确的，可复用**）
+
+
 
 ### 10.6 P4.1 录制与导出 SRT
 
