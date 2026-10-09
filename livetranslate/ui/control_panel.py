@@ -382,6 +382,33 @@ class ControlPanel(QWidget):
 
         layout.addWidget(asr_group)
 
+        # ── Audio source (the "A+B" route to captioning one app only) ──
+        # A: enumerate per-application audio sessions, so you can see who is
+        #    making noise and which endpoint they are rendering to.
+        # B: isolate by routing that app to a *different* endpoint than the one
+        #    we capture. The status line says whether that actually holds --
+        #    without it the user has no way to tell "isolated" from "capturing
+        #    everything and hoping".
+        self._sources_group = QGroupBox(t("group_audio_source"))
+        sources_layout = QVBoxLayout(self._sources_group)
+        sources_row = QHBoxLayout()
+        self._sources_status = QLabel("")
+        self._sources_status.setWordWrap(True)
+        sources_row.addWidget(self._sources_status, 1)
+        sources_refresh = QPushButton(t("btn_refresh"))
+        sources_refresh.clicked.connect(self._refresh_audio_sources)
+        sources_row.addWidget(sources_refresh)
+        sources_layout.addLayout(sources_row)
+        self._sources_list = QListWidget()
+        self._sources_list.setMaximumHeight(110)
+        sources_layout.addWidget(self._sources_list)
+        layout.addWidget(self._sources_group)
+        # Not refreshed here on purpose: the first enumeration walks the device
+        # tree and costs ~2.1s of blocking COM work, which would stall the panel
+        # while it is being built. The user asks for it explicitly instead.
+        self._sources_status.setText(t("audio_source_prompt"))
+        self._sources_status.setStyleSheet("color: #888; font-size: 11px;")
+
         # Whisper model download — only visible when engine is Whisper
         self._whisper_group = QGroupBox(t("group_download_whisper"))
         whisper_layout = QHBoxLayout(self._whisper_group)
@@ -533,6 +560,74 @@ class ControlPanel(QWidget):
         return widget
 
     # ── Translation Tab ──
+
+    def _refresh_audio_sources(self):
+        """Enumerate per-app audio sessions on demand.
+
+        Deliberately not on a timer: one refresh is ~0.25s of *blocking* COM work
+        on the UI thread once the endpoint list is cached, and ~2.1s for the very
+        first call (walking the device tree). That is fine behind a button and
+        would stutter the panel on a repeating timer.
+        """
+        from livetranslate.audio import sessions as audio_sessions
+
+        self._sources_list.clear()
+        idx = self._audio_device.currentIndex()
+        if idx == 0:
+            captured = "__disabled__"
+        elif idx == 1:
+            captured = None  # Windows default
+        else:
+            captured = self._audio_device.currentText()
+
+        def _set_status(text: str, colour: str) -> None:
+            self._sources_status.setText(text)
+            self._sources_status.setStyleSheet(f"color: {colour}; font-size: 11px;")
+
+        if captured == "__disabled__":
+            _set_status(t("audio_source_disabled"), "#888")
+            return
+        if not audio_sessions.available():
+            _set_status(t("audio_source_unavailable"), "#888")
+            return
+
+        def _label(name: str) -> str:
+            return t("audio_source_system") if name == audio_sessions.SYSTEM_LABEL else name
+
+        try:
+            endpoints = audio_sessions.list_by_endpoint()
+            diag = audio_sessions.diagnose(captured, endpoints)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Audio source refresh failed: {exc}")
+            _set_status(t("audio_source_unavailable"), "#888")
+            return
+
+        if diag.level == "unknown":
+            _set_status(t("audio_source_unavailable"), "#888")
+        elif diag.level == "warn":
+            apps = " / ".join(_label(a) for a in diag.playing)
+            _set_status(t("audio_source_mixed").format(apps=apps), "#c0392b")
+        elif diag.playing:
+            _set_status(
+                t("audio_source_single").format(
+                    app=_label(diag.playing[0]), dev=diag.captured
+                ),
+                "#1e8449",
+            )
+        else:
+            _set_status(t("audio_source_idle").format(dev=diag.captured), "#888")
+
+        for ep in endpoints:
+            if ep.error:
+                continue
+            for s in ep.playing:
+                self._sources_list.addItem(
+                    t("audio_source_row").format(
+                        app=_label(s.label), dev=ep.name, peak=s.peak
+                    )
+                )
+        if self._sources_list.count() == 0:
+            self._sources_list.addItem(t("audio_source_none"))
 
     def _create_translation_tab(self):
         widget = QWidget()

@@ -164,6 +164,25 @@ def _subwin_builds():
     return f"{len(win._text_widgets)} text widget(s) built"
 
 
+def _audio_source_panel():
+    """The audio-source group must build cheaply and refresh on demand.
+
+    Building it must not enumerate sessions (that is ~2.1s of blocking COM work
+    and would stall the panel); the explicit refresh must then produce a real
+    result, not an exception.
+    """
+    from livetranslate.ui.control_panel import ControlPanel
+
+    panel = ControlPanel(_config())
+    assert panel._sources_group is not None
+    assert panel._sources_list.count() == 0, "panel enumerated sessions while building"
+    assert panel._sources_status.text(), "no prompt shown before the first refresh"
+
+    panel._refresh_audio_sources()
+    assert panel._sources_list.count() >= 1, "refresh produced no rows"
+    return f"lazy build, {panel._sources_list.count()} row(s) after refresh"
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -171,6 +190,7 @@ def main() -> int:
     check("2. subtitle-window cinema presets", _subwin_presets)
     check("3. overlay pure mode + captions-only", _overlay_render)
     check("4. subtitle window builds + renders", _subwin_builds)
+    check("5. audio-source group (A) lazy build + refresh", _audio_source_panel)
 
     print("PASSED:")
     for p in PASS:

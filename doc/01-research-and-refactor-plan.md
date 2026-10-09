@@ -540,7 +540,44 @@ pip install -r requirements.txt
 | P3 电影字幕 | ✅ 提交 `bdb0233` |
 | **P4.1 SRT 导出** | ✅ 提交 `e989090` |
 | **P4.2 内存修复** | ✅ 见 10.8（含一处**实测推翻我原判断**的记录） |
-| P4.3 音频源过滤 A+B | ⏳ |
+| **P4.3 音频源过滤 A+B** | ✅ 见 10.10 |
+
+### 10.10 P4.3 音频源过滤 A+B
+
+**先做的事：可行性探测（`doc/migrations/probe_audio_source.py`），而不是先写 UI。**
+
+**根本约束**：WASAPI loopback 抓到的是**端点混音**，不是某个应用。想把单个进程的声音从这个混音里取出来，只有 process loopback 一条路（`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`）。所以"只录某个播放器"的可行路线是：
+
+- **A 枚举**：列出各应用的音频会话，并（因为会话是**按端点枚举**的）确认它在哪个设备上播放
+- **B 隔离**：把该应用路由到**另一个输出端点**，然后录那个端点
+
+**实测结论**
+
+| 项 | 结论 |
+|---|---|
+| A 会话枚举 | ✅ 可用。`AudioUtilities.GetAllSessions()` **只覆盖默认端点**，且 pycaw 的 `AudioSession` 不暴露 meter，所以本项目自己走 `IAudioSessionManager2` 逐端点枚举 + 直接 QueryInterface 取 `IAudioMeterInformation` |
+| B 设备隔离 | ⚠️ **需要第二个输出端点**。本机**当前只有一个可用渲染端点**（PortAudio 只报 `扬声器 (Realtek(R) Audio)`；pycaw 列出的 EDIFIER 耳机 / NVIDIA HDMI 等都是**注册过但未连接**的端点，激活时报 `AUDCLNT_E_DEVICE_INVALIDATED`）。接上耳机或显示器 HDMI 即有第二个；装虚拟声卡（VB-CABLE）则恒定可用 |
+| C 进程 loopback | 技术上可行（build 26300 ≫ 19041，comtypes 在位），但**无现成 pip 包，需手写 `ActivateAudioInterfaceAsync`** |
+
+**性能实测（决定了 UI 形态）**
+
+| 操作 | 耗时 |
+|---|---|
+| `GetAllDevices()`（走设备树） | **~2100ms，每次都要**（OS 层无缓存） |
+| 会话枚举（端点已解析） | ~200ms |
+| 首屏（含器件树） | ~3800ms |
+| 缓存端点后的刷新 | **~245ms** |
+
+因此 `SessionMonitor` **缓存端点列表**，刷新只重读会话——快 15 倍，才让"刷新按钮"这件事成立。
+
+**设计取舍**
+- **只读**：枚举会话与读峰值表**绝不改变用户听到的声音**
+- **不用定时器**：一次刷新是 UI 线程上 0.25s 的**阻塞** COM 调用，按按钮可以，每几秒跑一次会卡界面
+- **面板构造时不枚举**：首次要 2.1s，会把"打开设置"卡住。改为显式点「刷新」，初始显示提示语
+- **诊断要敢说"没隔离"**：`diagnose()` 明确区分三态——录的设备上没有应用发声 / 只有一个应用发声（此时系统回环**等效于**只录它）/ 多个应用同时发声（`warn`，会被一起录进去）。没有这层诊断，用户无法分辨"已隔离"和"其实在录全系统"
+
+**新增**：`livetranslate/audio/sessions.py`（`SessionMonitor` / `diagnose()`）、控制面板「音频源」组、`tests/test_audio_sessions.py`（23 个用例，覆盖两种设备名方言的匹配、会话标签、峰值阈值、诊断三态）、`requirements.txt += pycaw`。
+
 
 ### 10.6 P4.1 录制与导出 SRT
 
