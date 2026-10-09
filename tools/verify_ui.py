@@ -220,6 +220,27 @@ def _capture_target():
     return "select sets target, system row refused, clear restores device-wide"
 
 
+def _wizard_skips_cached_models():
+    """A first run must not re-download models that are already cached.
+
+    The setup wizard is triggered by a missing settings file, not by missing
+    models, so without an explicit check it always entered the download path --
+    a pre-fetched machine still showed "Downloading ...", which reads as "why is
+    it downloading again?".
+    """
+    from livetranslate.models.manager import get_missing_models
+    from livetranslate.ui.dialogs import SetupWizardDialog
+
+    if get_missing_models("funasr", "sensevoice-small", "ms"):
+        return "skipped (models are not cached on this machine)"
+
+    wizard = SetupWizardDialog()
+    wizard._download_worker("ms", "none")
+    assert wizard._skipped, "wizard entered the download path despite a full cache"
+    assert wizard._error is None, wizard._error
+    return "cache detected before the network was touched"
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -229,6 +250,7 @@ def main() -> int:
     check("4. subtitle window builds + renders", _subwin_builds)
     check("5. audio-source group (A) lazy build + refresh", _audio_source_panel)
     check("6. capture target selection (C wiring)", _capture_target)
+    check("7. setup wizard skips cached models", _wizard_skips_cached_models)
 
     print("PASSED:")
     for p in PASS:

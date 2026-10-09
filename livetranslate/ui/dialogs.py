@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from livetranslate.models.manager import download_asr, download_silero
+from livetranslate.models.manager import download_asr, download_silero, get_missing_models
 from livetranslate.paths import I18N_DIR
 from livetranslate.ui.i18n import t, get_lang
 
@@ -313,7 +313,23 @@ class SetupWizardDialog(QDialog):
         self._poll_timer.start()
 
     def _download_worker(self, hub, proxy):
+        self._skipped = False
         try:
+            # Check what is actually missing before touching the network.
+            #
+            # The wizard runs on first launch -- which is decided by whether a
+            # settings file exists, not by whether the models do. Without this
+            # check it always entered the download path, so a machine whose
+            # models had already been pre-fetched still showed "Downloading ...",
+            # which reads as "why is it downloading again?" even though the
+            # snapshot call only re-verified the cache and finished in ~2s.
+            missing = get_missing_models("funasr", "sensevoice-small", hub)
+            if not missing:
+                log.info("Models already cached; nothing to download")
+                self._skipped = True
+                return
+            for item in missing:
+                log.info(f"Missing model: {item['name']}")
             download_silero(proxy=proxy)
             download_asr("funasr", model_size="sensevoice-small", hub=hub, proxy=proxy)
         except Exception as e:
@@ -336,7 +352,9 @@ class SetupWizardDialog(QDialog):
             self._proxy_url.setEnabled(self._proxy_mode.currentIndex() == 2)
             return
 
-        self._append_log(f"\n{t('download_complete')}")
+        self._append_log(
+            f"\n{t('download_already_cached') if self._skipped else t('download_complete')}"
+        )
         hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
         from livetranslate.ui.control_panel import _save_settings
 
