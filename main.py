@@ -1924,6 +1924,15 @@ def main():
     os.environ["QT_LOGGING_RULES"] = (
         "qt.text.font.db=false;qt.qpa.fonts.warning=false"
     )
+    # DPI scaling policy, set before QApplication exists.
+    #
+    # PassThrough keeps a fractional scale factor (125%, 150%) instead of
+    # rounding it to an integer. Rounding is what blurs text here: the subtitle
+    # window renders through QPixmap, and if the ratio is rounded the pixmap is
+    # produced at the wrong size and then rescaled by the compositor.
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     # Pin a guaranteed TrueType UI font to avoid DirectWrite failures on the

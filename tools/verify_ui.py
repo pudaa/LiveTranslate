@@ -335,6 +335,53 @@ def _subtitle_partial_line():
     return "partial replaces in place, then clears on commit without duplicating"
 
 
+def _subtitle_marquee():
+    """The original line must scroll as one row, decaying by width not by count."""
+    import time as _time
+
+    from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS, SubtitleWindow
+
+    win = SubtitleWindow(dict(DEFAULT_SUBTITLE_WIN_SETTINGS))
+    win.show()
+    _APP.processEvents()
+    assert win._scroll_line_config() is not None, "no scroll-mode line is configured"
+    tw = win._text_widgets[0]
+    assert tw._scroll_mode, "the original line is not in marquee mode"
+
+    one_row = None
+    long_text = "那么第三个标准的划分叫做根据教育功能所呈现的方式的不同"
+    win._last_insert_time = 0.0
+    win._insert_sentence(long_text * 4, {})
+    _APP.processEvents()
+    one_row = tw.desired_height()
+    assert one_row > 0, "the marquee rendered nothing"
+    assert len(tw._marquee) == 1, tw._marquee
+
+    # Nothing wraps: adding much more text must not add a row.
+    win._insert_sentence(long_text * 4, {})
+    _APP.processEvents()
+    assert tw.desired_height() == one_row, "the line wrapped onto a second row"
+
+    # Overflow is dropped from the *front*, by width -- not by expiring whole
+    # sentences, which is what used to make the display jump between rows.
+    win._fit_height_snap()
+    _APP.processEvents()
+    shown = "".join(t for t, _ in tw._marquee)
+    assert shown, "everything was trimmed"
+    assert len(shown) < len(long_text * 4), "nothing was trimmed"
+    assert shown == (long_text * 4)[-len(shown):], "trimming did not take from the front"
+    assert "|" not in shown, "a pipe separator is still drawn"
+
+    # A pause shows up as blank width, and is capped so a long silence cannot
+    # scroll the whole line away.
+    cap = DEFAULT_SUBTITLE_WIN_SETTINGS["pause_gap_max_px"]
+    win._last_commit_time = _time.monotonic() - 60.0
+    assert win._pause_gap_px() == cap, "the pause gap is not capped"
+
+    win.close()
+    return f"one row ({one_row}px), trimmed to {len(shown)} chars from the front, gap cap {cap}px"
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -347,6 +394,7 @@ def main() -> int:
     check("7. setup wizard skips cached models", _wizard_skips_cached_models)
     check("8. subtitle lines: no duplicate, no blank gap", _subtitle_lines)
     check("9. subtitle in-progress line grows then commits once", _subtitle_partial_line)
+    check("10. subtitle marquee: one row, trims from the front", _subtitle_marquee)
 
     print("PASSED:")
     for p in PASS:

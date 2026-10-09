@@ -328,7 +328,8 @@ class SubtitleSettingsWidget(QWidget):
         self._settings = {**DEFAULT_SUBTITLE_WIN_SETTINGS, **(settings or {})}
         self._spacing_spin.setValue(self._settings.get("line_spacing", 8))
         self._min_display_spin.setValue(self._settings.get("min_display_ms", 1500))
-        self._width_spin.setValue(self._settings.get("window_width", 1000))
+        self._width_spin.setValue(self._settings.get("window_width", 860))
+        self._scale_spin.setValue(int(round(self._settings.get("size_scale", 1.0) * 100)))
         self._bg_color_btn.set_color(self._settings.get("bg_color", "#000000"))
         self._bg_opacity_spin.setValue(round(self._settings.get("bg_opacity", 0) / 255 * 100))
         self._border_radius_spin.setValue(self._settings.get("border_radius", 8))
@@ -380,9 +381,20 @@ class SubtitleSettingsWidget(QWidget):
         self._width_spin = QSpinBox()
         self._width_spin.setRange(200, 3840)
         self._width_spin.setSuffix(" px")
-        self._width_spin.setValue(self._settings.get("window_width", 1000))
+        self._width_spin.setValue(self._settings.get("window_width", 860))
         self._width_spin.valueChanged.connect(self._on_change)
         g.addWidget(self._width_spin, r, 1)
+        r += 1
+
+        g.addWidget(QLabel(t("subwin_size_scale")), r, 0)
+        self._scale_spin = QSpinBox()
+        self._scale_spin.setRange(40, 200)
+        self._scale_spin.setSingleStep(5)
+        self._scale_spin.setSuffix(" %")
+        self._scale_spin.setToolTip(t("subwin_size_scale_tip"))
+        self._scale_spin.setValue(int(round(self._settings.get("size_scale", 1.0) * 100)))
+        self._scale_spin.valueChanged.connect(self._on_change)
+        g.addWidget(self._scale_spin, r, 1)
         r += 1
 
         g.addWidget(QLabel(t("subwin_line_spacing")), r, 0)
@@ -654,6 +666,7 @@ class SubtitleSettingsWidget(QWidget):
             "line_spacing": self._spacing_spin.value(),
             "min_display_ms": self._min_display_spin.value(),
             "window_width": self._width_spin.value(),
+            "size_scale": self._scale_spin.value() / 100.0,
             "bg_color": self._bg_color_btn.color(),
             "bg_opacity": round(self._bg_opacity_spin.value() / 100 * 255),
             "border_radius": self._border_radius_spin.value(),

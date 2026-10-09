@@ -53,7 +53,7 @@ def _resolve_image_path(path: str) -> str:
 DEFAULT_SUBTITLE_WIN_SETTINGS = {
     "enabled": False,
     "sentences": 1,
-    "window_width": 1000,
+    "window_width": 860,
     "line_spacing": 8,
     "bg_color": "#000000",
     "bg_opacity": 76,
@@ -62,6 +62,14 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     "auto_hide_timeout": 5,
     "auto_hide_animation": "fade",
     "auto_hide_duration": 300,
+    # Subtitle sizing is relative: what matters is how many characters fit across
+    # the video, and the video is often a small window rather than full screen.
+    # One control that scales the bar and the type together keeps that ratio
+    # adjustable instead of hard-coded.
+    "size_scale": 1.0,
+    # Pause width standing in for the silence that followed a sentence.
+    "pause_gap_px_per_s": 70.0,
+    "pause_gap_max_px": 170.0,
     # Minimum time a sentence stays up before it may be replaced, in ms.
     # Applied by delaying the replacement, so a large value makes live captions
     # lag the audio; 0 disables the throttle.
@@ -72,7 +80,7 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
             "type": "original",
             "enabled": True,
             "font_family": "Microsoft YaHei",
-            "font_size": 24,
+            "font_size": 20,
             "color": "#FFFFFF",
             "opacity": 255,
             "outline_enabled": True,
@@ -83,13 +91,18 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
             "entry_animation": "none",
             "exit_animation": "none",
             "animation_duration": 300,
+            # The original line scrolls; see _render_marquee_pixmap. The
+            # translation line still wraps, because it is read as a block rather
+            # than tracked word by word.
+            "scroll": True,
+            "fade_out_px": 96,
         },
         {
             "type": "translation",
             "lang": "zh",
             "enabled": True,
             "font_family": "Microsoft YaHei",
-            "font_size": 28,
+            "font_size": 23,
             "color": "#FFD700",
             "opacity": 255,
             "outline_enabled": True,
@@ -155,6 +168,14 @@ class _SubtitleTextWidget(QWidget):
         self._anim_group = None
         self._pending_text = None
 
+        # Marquee mode: one non-wrapping line, anchored at the right edge, that
+        # carries the words leftwards. Text leaves by fading out past the left
+        # edge instead of by being replaced, so nothing the reader is looking at
+        # ever jumps sideways. See set_marquee().
+        self._scroll_mode = False
+        self._marquee: list[list] = []  # [[text, gap_px_after], ...]
+        self._fade_out_px = 96
+
     # --- pyqtProperty for content opacity ---
     def _get_content_opacity(self):
         return self._content_opacity_val
@@ -184,8 +205,9 @@ class _SubtitleTextWidget(QWidget):
 
     slide_offset_y = pyqtProperty(float, _get_slide_offset_y, _set_slide_offset_y)
 
-    def set_config(self, cfg: dict):
-        self._font = QFont(cfg.get("font_family", "Microsoft YaHei"), cfg.get("font_size", 24))
+    def set_config(self, cfg: dict, scale: float = 1.0):
+        size = max(6, int(round(cfg.get("font_size", 24) * scale)))
+        self._font = QFont(cfg.get("font_family", "Microsoft YaHei"), size)
         c = QColor(cfg.get("color", "#FFFFFF"))
         c.setAlpha(cfg.get("opacity", 255))
         self._color = c
@@ -193,6 +215,8 @@ class _SubtitleTextWidget(QWidget):
         self._outline_color = QColor(cfg.get("outline_color", "#000000"))
         self._outline_width = cfg.get("outline_width", 2)
         self._align = cfg.get("align", "center")
+        self._scroll_mode = bool(cfg.get("scroll", False))
+        self._fade_out_px = int(cfg.get("fade_out_px", 96))
         resolved = _resolve_image_path(cfg.get("bg_image", ""))
         self._bg_pixmap = QPixmap(resolved) if resolved else None
         self._entry_animation = cfg.get("entry_animation", "none")
@@ -390,10 +414,43 @@ class _SubtitleTextWidget(QWidget):
 
         return segments or [text]
 
+    def set_marquee(self, items: list) -> None:
+        """Render a single, non-wrapping, right-anchored line.
+
+        ``items`` is ``[[text, gap_px_after], ...]``. The gap after a segment is
+        blank width standing in for the pause that followed it -- which is how a
+        speaker's silence gets represented, rather than by punctuation the reader
+        has no reason to understand.
+
+        The newest text always ends at the right edge, so new words appear in a
+        fixed place and the older words are what moves.
+        """
+        self._marquee = [[str(t), float(g or 0.0)] for t, g in items]
+        self._text = "".join(t for t, _ in self._marquee)
+        self._wrapped_lines = [self._text] if self._text else []
+        self._pending_text = None
+        self._text_cache = None
+        self.setFixedHeight(self.desired_height())
+        self.update()
+
+    def marquee_width(self) -> float:
+        """Rendered width of the whole marquee, gaps included."""
+        if not self._scroll_mode or not self._marquee:
+            return 0.0
+        fm = QFontMetrics(self._font)
+        total = 0.0
+        for text, gap in self._marquee:
+            total += fm.horizontalAdvance(text) + gap
+        return total
+
     def _rewrap(self):
         """Recalculate wrapped lines from current text."""
         if not self._text:
             self._wrapped_lines = []
+        elif self._scroll_mode:
+            # Never wrap: the line scrolls instead. Wrapping is what made the
+            # display flip between one and two rows as sentences expired.
+            self._wrapped_lines = [self._text]
         else:
             self._wrapped_lines = self.split_text(self._text)
 
@@ -421,7 +478,101 @@ class _SubtitleTextWidget(QWidget):
             self._text_cache = None
             self.setFixedHeight(self.desired_height())
 
+    def _render_marquee_pixmap(self):
+        w = self.width()
+        h = self.desired_height()
+        if w <= 0 or h <= 0 or not self._marquee:
+            self._text_cache = None
+            return
+
+        dpr = self.devicePixelRatioF()
+        pw, ph = int(w * dpr), int(h * dpr)
+        if pw <= 0 or ph <= 0:
+            self._text_cache = None
+            return
+
+        pix = QPixmap(pw, ph)
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(QColor(0, 0, 0, 0))
+
+        painter = QPainter(pix)
+        if not painter.isActive():
+            self._text_cache = None
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        fm = QFontMetrics(self._font)
+        ow = self._outline_width if self._outline_enabled else 0
+        # Snap to device pixels. The glyphs are laid out at fractional x while
+        # the line scrolls, and an unaligned glyph is re-sampled by the rasteriser
+        # -- which is what makes scrolling text look soft compared with static
+        # text. Snapping to 1/dpr keeps it as sharp as it can be at any scale.
+        dpr = self.devicePixelRatioF() or 1.0
+
+        def snap(value: float) -> float:
+            return round(value * dpr) / dpr
+
+        baseline = snap(ow + fm.ascent())
+
+        outline_pen = None
+        if self._outline_enabled and self._outline_width > 0:
+            outline_pen = QPen(
+                self._outline_color,
+                self._outline_width * 2,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+
+        # Right-anchored: the end of the line is pinned to the right edge, so the
+        # newest words land in a fixed place and the older ones travel left.
+        x = float(w - ow - self.marquee_width())
+        for text, gap in self._marquee:
+            for ch in text:
+                self._draw_marquee_char(painter, fm, ch, snap(x), baseline, outline_pen)
+                x += fm.horizontalAdvance(ch)
+            x += gap
+
+        painter.end()
+        self._text_cache = pix
+
+    def _draw_marquee_char(self, painter, fm, ch, x, baseline, outline_pen):
+        """Draw one character, fading it out as it passes the left edge.
+
+        Per character rather than per path because the alpha varies along the
+        line. CJK has no shaping to lose; for Latin scripts the kerning between
+        adjacent glyphs is sacrificed, which is the price of a soft left edge.
+        """
+        if not ch.strip():
+            return
+        cw = fm.horizontalAdvance(ch)
+        if x + cw <= -self._fade_out_px:
+            return  # fully past the fade zone
+        if x >= 0:
+            alpha = 1.0
+        else:
+            alpha = max(0.0, 1.0 + x / max(1, self._fade_out_px))
+        if alpha <= 0.0:
+            return
+
+        path = QPainterPath()
+        path.addText(x, baseline, self._font, ch)
+
+        if outline_pen is not None:
+            painter.setPen(outline_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+
+        colour = QColor(self._color)
+        colour.setAlphaF(colour.alphaF() * alpha)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(colour))
+        painter.drawPath(path)
+
     def _render_text_pixmap(self):
+        if self._scroll_mode:
+            self._render_marquee_pixmap()
+            return
         lines = self._wrapped_lines or [self._text]
         w = self.width()
         h = self.desired_height()
@@ -521,6 +672,15 @@ class SubtitleWindow(QWidget):
         # the subtitle arrives after the audio it describes, which is the one
         # thing a live caption must not do.
         self._partial = ""
+        # Pause width after each sentence, in px, parallel to _sentences. A
+        # speaker's silence is drawn as blank width rather than as a separator
+        # character, so the reader sees time pass instead of punctuation.
+        self._gaps: list[float] = []
+        self._live_gap_px = 0.0
+        self._last_commit_time = 0.0
+        self._gap_timer = QTimer(self)
+        self._gap_timer.setInterval(100)
+        self._gap_timer.timeout.connect(self._grow_pause_gap)
         self._drag_pos = None
         self._bg_pixmap = None
         self._click_through = bool(self._settings.get("click_through", False))
@@ -583,7 +743,6 @@ class SubtitleWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         s = self._settings
-        w = s.get("window_width", 1000)
         saved_x = s.get("window_x")
         saved_y = s.get("window_y")
         if saved_x is not None and saved_y is not None:
@@ -593,7 +752,7 @@ class SubtitleWindow(QWidget):
                 self.move(100, 100)
         else:
             self.move(100, 100)
-        self.setFixedWidth(w)
+        self.setFixedWidth(self._effective_width())
 
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(0, 0, 0, 0)
@@ -614,6 +773,16 @@ class SubtitleWindow(QWidget):
         self._fit_height_animated()
         self.set_click_through(self._click_through)
 
+    def _size_scale(self) -> float:
+        """Overall caption scale, clamped to a sane range."""
+        try:
+            return max(0.4, min(2.0, float(self._settings.get("size_scale", 1.0))))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _effective_width(self) -> int:
+        return int(self._settings.get("window_width", 860) * self._size_scale())
+
     def _rebuild_text_widgets(self):
         for w in self._text_widgets:
             self._content_layout.removeWidget(w)
@@ -624,7 +793,7 @@ class SubtitleWindow(QWidget):
             if not line_cfg.get("enabled", True):
                 continue
             tw = _SubtitleTextWidget()
-            tw.set_config(line_cfg)
+            tw.set_config(line_cfg, self._size_scale())
             tw.height_changed.connect(self._fit_height_animated)
             self._text_widgets.append(tw)
             self._content_layout.addWidget(tw)
@@ -708,15 +877,14 @@ class SubtitleWindow(QWidget):
             if not line_cfg.get("enabled", True):
                 continue
             tw = _SubtitleTextWidget()
-            tw.set_config(line_cfg)
+            tw.set_config(line_cfg, self._size_scale())
             tw.height_changed.connect(self._fit_height_animated)
             self._text_widgets.append(tw)
             self._content_layout.addWidget(tw)
 
         self._content_layout.setSpacing(self._settings.get("line_spacing", 8))
 
-        w = self._settings.get("window_width", 1000)
-        self.setFixedWidth(w)
+        self.setFixedWidth(self._effective_width())
 
         self._apply_background()
         self._refresh_display()
@@ -871,6 +1039,7 @@ class SubtitleWindow(QWidget):
         self._refresh_display()
         if self._partial:
             self._restart_auto_hide_timer()
+            self._start_gap_timer()
 
     def _on_update_text(self, original: str, translations_json: str):
         translations = json.loads(translations_json)
@@ -895,11 +1064,24 @@ class SubtitleWindow(QWidget):
         """Insert a single sentence and refresh display."""
 
         max_sentences = self._settings.get("sentences", 1)
-        self._sentences.append((original, translations))
-        if len(self._sentences) > max_sentences:
-            self._sentences = self._sentences[-max_sentences:]
+        # Mutable entries: the marquee trims leading characters in place.
+        self._sentences.append([original, translations])
+        if self._scroll_line_config() is None:
+            # Wrapped mode keeps count-based expiry. Scroll mode decays by width
+            # instead, so nothing jumps when a sentence ages out.
+            if len(self._sentences) > max_sentences:
+                self._sentences = self._sentences[-max_sentences:]
+        else:
+            # The pause that just ended belongs to the sentence before this one.
+            if self._gaps:
+                self._gaps[-1] = self._live_gap_px
+            while len(self._gaps) < len(self._sentences):
+                self._gaps.append(0.0)
+        self._live_gap_px = 0.0
+        self._last_commit_time = time.monotonic()
         # The committed text now covers whatever the partial line was showing.
         self._partial = ""
+        self._start_gap_timer()
 
         if self._is_hidden_by_timeout:
             self._restore_from_auto_hide()
@@ -915,6 +1097,105 @@ class SubtitleWindow(QWidget):
             timer.deleteLater()
         self._pending_segment_timers.clear()
 
+
+    def _scroll_line_config(self):
+        """The first enabled line configured to scroll, or None."""
+        for cfg in self._settings.get("lines", []):
+            if cfg.get("enabled", True) and cfg.get("scroll"):
+                return cfg
+        return None
+
+    def _pause_gap_px(self) -> float:
+        """Blank width representing the silence since the last commit."""
+        rate = float(self._settings.get("pause_gap_px_per_s", 70.0))
+        cap = float(self._settings.get("pause_gap_max_px", 170.0))
+        if self._last_commit_time <= 0:
+            return 0.0
+        return min(cap, (time.monotonic() - self._last_commit_time) * rate)
+
+    def _grow_pause_gap(self) -> None:
+        """Let the tail gap widen as time passes.
+
+        This is what makes a pause visible: with nothing being said there are no
+        new words to push the line along, so the gap itself does the pushing and
+        the caption keeps travelling left. Capped, or a long silence would
+        scroll the whole line off and leave a blank bar.
+        """
+        if not self._sentences and not self._partial:
+            self._gap_timer.stop()
+            return
+        gap = self._pause_gap_px()
+        if abs(gap - self._live_gap_px) < 1.0:
+            self._gap_timer.stop()  # saturated at the cap
+            return
+        self._live_gap_px = gap
+        self._refresh_display()
+
+    def _start_gap_timer(self) -> None:
+        if self._scroll_line_config() and not self._gap_timer.isActive():
+            self._gap_timer.start()
+
+    def _marquee_items(self, line_type: str, cfg: dict) -> list:
+        """Build ``[[text, gap_px_after], ...]`` for one scroll-mode line."""
+        items: list[list] = []
+        for i, (original, tl_dict) in enumerate(self._sentences):
+            if line_type == "original":
+                text = original
+            else:
+                text = self._translation_for(tl_dict, cfg)
+            if not text:
+                continue
+            gap = self._gaps[i] if i < len(self._gaps) else 0.0
+            if i == len(self._sentences) - 1:
+                gap = self._live_gap_px  # the tail gap is still growing
+            items.append([text, gap])
+        if self._partial:
+            items.append([self._partial, 0.0])
+        return items
+
+    @staticmethod
+    def _translation_for(tl_dict, cfg: dict) -> str:
+        if isinstance(tl_dict, str):
+            return tl_dict
+        lang = cfg.get("lang", "")
+        if lang and lang in tl_dict:
+            return tl_dict[lang]
+        if "" in tl_dict and tl_dict[""]:
+            return tl_dict[""]
+        for value in tl_dict.values():
+            if value:
+                return value
+        return ""
+
+    def _trim_marquee(self, tw) -> None:
+        """Drop what has travelled past the left edge.
+
+        Trimming is by rendered width, not by sentence count. Expiring whole
+        sentences is what made the display jump between one and two rows, and it
+        yanks the text the reader is following sideways; trimming a few
+        characters at a time lets the line leave the way it arrived.
+        """
+        if tw is None or not self._sentences or tw.width() <= 0:
+            return
+        cfg = self._scroll_line_config() or {}
+        limit = tw.width() + int(cfg.get("fade_out_px", 96))
+        fm = QFontMetrics(tw._font)
+        for _ in range(200):  # bounded: each pass drops at least one character
+            total = sum(fm.horizontalAdvance(s[0]) for s in self._sentences)
+            total += sum(self._gaps) + fm.horizontalAdvance(self._partial)
+            if total <= limit or not self._sentences:
+                return
+            head = self._sentences[0][0]
+            if not head:
+                self._sentences.pop(0)
+                if self._gaps:
+                    self._gaps.pop(0)
+                continue
+            excess = total - limit
+            all_text = "".join(s[0] for s in self._sentences)
+            avg = max(1.0, total / max(1, len(all_text)))
+            drop = max(1, min(len(head), int(excess / avg) or 1))
+            self._sentences[0][0] = head[drop:]
 
     def _refresh_display(self):
         # The in-progress line counts as content: at the start of an utterance
@@ -934,6 +1215,15 @@ class SubtitleWindow(QWidget):
                 break
             tw = self._text_widgets[wi]
             line_type = cfg.get("type", "original")
+
+            if cfg.get("scroll") and tw._scroll_mode:
+                items = self._marquee_items(line_type, cfg)
+                if line_type == "original":
+                    self._trim_marquee(tw)
+                    items = self._marquee_items(line_type, cfg)
+                tw.set_marquee(items)
+                wi += 1
+                continue
 
             if line_type == "original":
                 texts = [s[0] for s in self._sentences if s[0]]
@@ -957,7 +1247,9 @@ class SubtitleWindow(QWidget):
                             if v:
                                 texts.append(v)
                                 break
-            tw.set_text(" | ".join(texts) if len(texts) > 1 else (texts[0] if texts else ""))
+            # A wide space, not "|": a pipe between sentences is notation the
+            # reader has no reason to interpret.
+            tw.set_text("　".join(texts) if len(texts) > 1 else (texts[0] if texts else ""))
             wi += 1
 
     def get_target_languages(self) -> set:
@@ -972,6 +1264,10 @@ class SubtitleWindow(QWidget):
 
     def clear(self):
         self._sentences.clear()
+        self._gaps.clear()
+        self._partial = ""
+        self._live_gap_px = 0.0
+        self._gap_timer.stop()
         self._cancel_pending_segments()
         self._auto_hide_timer.stop()
         self._is_hidden_by_timeout = False
