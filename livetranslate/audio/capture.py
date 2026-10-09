@@ -18,6 +18,14 @@ DEVICE_CHECK_INTERVAL = 2.0  # seconds
 # also degraded to quadratic as it grew.
 MIC_BUFFER_MAX_SECONDS = 2.0
 
+# Same idea for the per-process source, which delivers whatever the OS has
+# buffered rather than a fixed chunk size.
+PROC_BUFFER_MAX_SECONDS = 2.0
+
+# How long to wait before retrying a failed per-process capture. The target
+# application may have exited; if it comes back we want to reconnect on our own.
+PROC_RETRY_INTERVAL = 3.0
+
 
 def list_output_devices():
     """Return list of WASAPI output device names."""
@@ -90,6 +98,17 @@ class AudioCapture:
         self._mic_native_channels = 1
         self._mic_restart_event = threading.Event()
         self._mic_buf = np.array([], dtype=np.float32)
+
+        # Per-process source (see set_target_process). When _target_process is
+        # set the loop reads from a process-loopback capture instead of the
+        # device-wide PyAudio stream.
+        self._target_process: str | None = None
+        self._pending_target_process: str | None = None
+        self._process_capture = None
+        self._process_pid: int | None = None
+        self._proc_buf = np.array([], dtype=np.float32)
+        self._proc_last_attempt = 0.0
+        self._proc_restart_event = threading.Event()
 
     def _get_wasapi_info(self):
         for i in range(self._pa.get_host_api_count()):
@@ -280,16 +299,132 @@ class AudioCapture:
                 "(loopback stream is likely down)"
             )
 
+    # ── per-process source ──────────────────────────────────────────────────
+
+    @property
+    def _wants_process_source(self) -> bool:
+        """True when a per-process target is configured (or about to be).
+
+        ``_pending_target_process`` matters because main.py calls
+        set_target_process before start(), and the read loop only promotes it to
+        ``_target_process`` on its first pass.
+        """
+        return (self._pending_target_process or self._target_process) is not None
+
+    def set_target_process(self, name: str | None) -> None:
+        """Capture one application instead of the whole output device.
+
+        ``name`` is an executable name such as ``"vlc.exe"``; ``None`` restores
+        device-wide capture. The reopen is deferred to the read thread, which
+        owns the stream -- doing it here would race with it.
+        """
+        name = (name or "").strip() or None
+        if name == self._pending_target_process:
+            return
+        self._pending_target_process = name
+        self._proc_restart_event.set()
+
+    @property
+    def target_process(self) -> str | None:
+        return self._target_process
+
+    def _open_process_capture(self) -> bool:
+        """Resolve the target executable and open a loopback capture for it."""
+        from livetranslate.audio import proc_loopback as plp
+
+        if not plp.available():
+            log.error("Process loopback is unavailable on this Windows build")
+            return False
+        if not self._target_process:
+            return False
+
+        pids = plp.find_pids_by_name(self._target_process)
+        if not pids:
+            log.warning(f"Target process not running: {self._target_process}")
+            return False
+        # Prefer the pid we already had if it is still alive; otherwise take the
+        # highest, which is the best available guess at "the most recent
+        # instance" of that executable.
+        pid = self._process_pid if self._process_pid in pids else max(pids)
+
+        try:
+            capture = plp.ProcessLoopbackCapture(pid)
+            capture.open()
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                f"Process loopback open failed for '{self._target_process}' "
+                f"(pid {pid}): {exc}"
+            )
+            return False
+
+        self._process_capture = capture
+        self._process_pid = pid
+        self._proc_buf = np.array([], dtype=np.float32)
+        log.info(
+            f"Audio source: process '{self._target_process}' (pid {pid}) -- "
+            "other applications are not captured"
+        )
+        return True
+
+    def _close_process_capture(self) -> None:
+        cap, self._process_capture = self._process_capture, None
+        self._process_pid = None
+        if cap is not None:
+            try:
+                cap.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _read_process_chunk(self) -> np.ndarray | None:
+        """One fixed-size chunk of 16 kHz mono float32, or None if not enough is
+        buffered yet.
+
+        The OS hands over however much it has rather than a fixed chunk size, so
+        re-chunk here to match the endpoint path's contract.
+        """
+        cap = self._process_capture
+        if cap is None:
+            # Not open: the target may have exited, or the first attempt failed.
+            # Retry slowly so a restarted application reconnects on its own.
+            now = time.monotonic()
+            if now - self._proc_last_attempt >= PROC_RETRY_INTERVAL:
+                self._proc_last_attempt = now
+                self._open_process_capture()
+            return None
+
+        try:
+            raw = cap.read()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Process loopback read failed, will retry: {exc}")
+            self._close_process_capture()
+            self._proc_last_attempt = time.monotonic()
+            return None
+
+        if raw:
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if samples.size:
+                self._proc_buf = np.concatenate([self._proc_buf, samples])
+                cap_samples = int(self.sample_rate * PROC_BUFFER_MAX_SECONDS)
+                if self._proc_buf.size > cap_samples:
+                    self._proc_buf = self._proc_buf[-cap_samples:]
+
+        need = int(self.sample_rate * self.chunk_duration)
+        if self._proc_buf.size < need:
+            return None
+        chunk = self._proc_buf[:need]
+        self._proc_buf = self._proc_buf[need:]
+        return chunk
+
     def _restart_stream(self):
         """Restart stream with new default device."""
         with self._lock:
             self._close_stream()
             self._pa.terminate()
             self._pa = pyaudio.PyAudio()
-            if not self._loopback_disabled:
-                self._open_stream()
+            if self._loopback_disabled or self._wants_process_source:
+                log.info("Loopback stream not needed for the current audio source")
             else:
-                log.info("Loopback disabled (mic-only mode)")
+                self._open_stream()
             # Re-open mic if active
             if self._mic_device_name:
                 self._close_mic_stream()
@@ -357,9 +492,42 @@ class AudioCapture:
                     except Exception as e:
                         log.warning(f"Device check error: {e}")
 
-            # Read loopback chunk or generate silence for mic-only mode
+            # Handle switching between the device-wide source and a per-process
+            # one. Reopening here rather than in set_target_process keeps every
+            # touch of the source on this thread.
+            if self._proc_restart_event.is_set():
+                self._proc_restart_event.clear()
+                self._close_process_capture()
+                self._target_process = self._pending_target_process
+                if self._target_process:
+                    self._open_process_capture()
+                else:
+                    log.info("Audio source: output device (all applications)")
+                # Drop anything queued from the previous source so the two are
+                # never spliced into the same utterance.
+                while not self.audio_queue.empty():
+                    try:
+                        self.audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+            # Read one chunk from whichever source is configured.
+            #
+            #  * endpoint (default): WASAPI loopback of an output device, i.e.
+            #    *everything* playing on it.
+            #  * process: process loopback scoped to one executable, so other
+            #    applications are not captured at all -- and unlike routing the
+            #    target to a second output device, this needs no extra hardware.
+            #
+            # Both paths produce 16 kHz mono float32, so the mic mixing below is
+            # shared and needs no special casing.
             loopback_audio = None
-            if self._loopback_disabled:
+            if self._target_process is not None:
+                loopback_audio = self._read_process_chunk()
+                if loopback_audio is None:
+                    time.sleep(0.005)
+                    continue
+            elif self._loopback_disabled:
                 time.sleep(self.chunk_duration)
                 n_samples = int(self.sample_rate * self.chunk_duration)
                 loopback_audio = np.zeros(n_samples, dtype=np.float32)
@@ -434,7 +602,15 @@ class AudioCapture:
 
     def start(self):
         self._loopback_disabled = self._device_name == "__disabled__"
-        if not self._loopback_disabled:
+        if self._wants_process_source:
+            # The device-wide stream is never read when scoped to a process, so
+            # do not open it at all.
+            log.info(
+                "Audio source: process "
+                f"'{self._pending_target_process or self._target_process}' "
+                "(device stream not opened)"
+            )
+        elif not self._loopback_disabled:
             self._open_stream()
         else:
             log.info("Loopback disabled (mic-only mode)")
@@ -454,6 +630,7 @@ class AudioCapture:
             self._read_thread.join(timeout=3)
         self._close_stream()
         self._close_mic_stream()
+        self._close_process_capture()
         log.info("Audio capture stopped")
 
     def get_audio(self, timeout=1.0):

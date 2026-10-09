@@ -183,6 +183,43 @@ def _audio_source_panel():
     return f"lazy build, {panel._sources_list.count()} row(s) after refresh"
 
 
+def _capture_target():
+    """Selecting a row must set the capture target; system rows must be refused.
+
+    The system-sounds session has pid 0 and no process, so it cannot be a
+    process-loopback target -- picking it silently would leave the user
+    believing they had isolated something when they had not.
+    """
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QListWidgetItem
+
+    from livetranslate.ui.control_panel import ControlPanel
+
+    panel = ControlPanel(_config())
+    panel._current_settings["audio_target_process"] = ""
+    panel._update_audio_target_label()
+    assert panel._sources_target.text(), "no 'capture everything' label"
+
+    panel._sources_list.clear()
+    panel._sources_list.addItem(QListWidgetItem("system sounds row"))
+    panel._sources_list.setCurrentRow(0)
+    panel._capture_selected_process()
+    assert not panel._current_settings.get("audio_target_process"), \
+        "a row with no process became the capture target"
+
+    row = QListWidgetItem("vlc.exe row")
+    row.setData(Qt.ItemDataRole.UserRole, "vlc.exe")
+    panel._sources_list.addItem(row)
+    panel._sources_list.setCurrentItem(row)
+    panel._capture_selected_process()
+    assert panel._current_settings["audio_target_process"] == "vlc.exe"
+    assert "vlc.exe" in panel._sources_target.text(), panel._sources_target.text()
+
+    panel._set_audio_target("")
+    assert panel._current_settings["audio_target_process"] == ""
+    return "select sets target, system row refused, clear restores device-wide"
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -191,6 +228,7 @@ def main() -> int:
     check("3. overlay pure mode + captions-only", _overlay_render)
     check("4. subtitle window builds + renders", _subwin_builds)
     check("5. audio-source group (A) lazy build + refresh", _audio_source_panel)
+    check("6. capture target selection (C wiring)", _capture_target)
 
     print("PASSED:")
     for p in PASS:

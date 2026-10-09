@@ -18,6 +18,15 @@ output:
 audio:
   # WASAPI loopback device name (null = default output device)
   device: null
+  # Capture only one application's audio instead of the whole output device.
+  # Empty/"null" = capture everything playing (default).
+  #
+  # An executable name, e.g. "vlc.exe". Uses WASAPI process loopback, so other
+  # applications are not captured at all -- unlike routing the target to a
+  # second output device, this needs no extra hardware. Requires Windows 10
+  # 2004+ (build 19041). Better set from the UI (settings -> VAD/ASR ->
+  # "Audio source"), which lists what is currently playing.
+  target_process: ""
   # Sample rate for capture
   sample_rate: 16000
   # Audio chunk duration in seconds for VAD processing (32ms = Silero VAD native window)

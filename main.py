@@ -171,6 +171,12 @@ class LiveTranslateApp:
             sample_rate=config["audio"]["sample_rate"],
             chunk_duration=config["audio"]["chunk_duration"],
         )
+        # Capture one application instead of the whole output device, when
+        # configured. set_target_process only signals, so this is safe before
+        # the capture thread starts -- the loop picks it up on its first pass.
+        _target_process = (config["audio"].get("target_process") or "").strip()
+        if _target_process:
+            self._audio.set_target_process(_target_process)
         self._vad = VADProcessor(
             sample_rate=config["audio"]["sample_rate"],
             threshold=config["asr"]["vad_threshold"],
@@ -337,6 +343,8 @@ class LiveTranslateApp:
                     self._overlay.update_monitor(0.0, 0.0)
         if "mic_device" in settings:
             self._audio.set_mic_device(settings["mic_device"])
+        if "audio_target_process" in settings:
+            self._audio.set_target_process(settings["audio_target_process"] or None)
         if "incremental_asr" in settings:
             self._incremental_enabled = settings["incremental_asr"]
         if "interim_interval" in settings:

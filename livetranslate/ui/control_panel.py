@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QBrush, QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -402,12 +402,29 @@ class ControlPanel(QWidget):
         self._sources_list = QListWidget()
         self._sources_list.setMaximumHeight(110)
         sources_layout.addWidget(self._sources_list)
+
+        # Capture-target row: the whole point of the panel. "Process loopback"
+        # captures only the chosen executable, so nothing else on the machine
+        # ends up captioned -- and unlike routing the target to a second output
+        # device, it needs no extra hardware.
+        target_row = QHBoxLayout()
+        self._sources_target = QLabel("")
+        self._sources_target.setWordWrap(True)
+        target_row.addWidget(self._sources_target, 1)
+        self._capture_selected_btn = QPushButton(t("audio_source_capture_selected"))
+        self._capture_selected_btn.clicked.connect(self._capture_selected_process)
+        target_row.addWidget(self._capture_selected_btn)
+        self._capture_all_btn = QPushButton(t("audio_source_capture_all"))
+        self._capture_all_btn.clicked.connect(lambda: self._set_audio_target(""))
+        target_row.addWidget(self._capture_all_btn)
+        sources_layout.addLayout(target_row)
         layout.addWidget(self._sources_group)
         # Not refreshed here on purpose: the first enumeration walks the device
         # tree and costs ~2.1s of blocking COM work, which would stall the panel
         # while it is being built. The user asks for it explicitly instead.
         self._sources_status.setText(t("audio_source_prompt"))
         self._sources_status.setStyleSheet("color: #888; font-size: 11px;")
+        self._update_audio_target_label()
 
         # Whisper model download — only visible when engine is Whisper
         self._whisper_group = QGroupBox(t("group_download_whisper"))
@@ -617,17 +634,63 @@ class ControlPanel(QWidget):
         else:
             _set_status(t("audio_source_idle").format(dev=diag.captured), "#888")
 
+        # List every session, not just the ones currently making noise: the
+        # point of the list is to *choose* a capture target, and you want to be
+        # able to pick the player before you press play.
         for ep in endpoints:
             if ep.error:
                 continue
-            for s in ep.playing:
-                self._sources_list.addItem(
+            for s in sorted(ep.sessions, key=lambda x: -x.peak):
+                item = QListWidgetItem(
                     t("audio_source_row").format(
                         app=_label(s.label), dev=ep.name, peak=s.peak
                     )
                 )
+                # Only a real process can be a process-loopback target; the
+                # shared system-sounds session (pid 0) has no process to scope to.
+                if s.pid > 0 and s.process:
+                    item.setData(Qt.ItemDataRole.UserRole, s.process)
+                    if not s.is_playing:
+                        item.setForeground(QBrush(QColor("#999999")))
+                else:
+                    item.setToolTip(t("audio_source_system_hint"))
+                self._sources_list.addItem(item)
         if self._sources_list.count() == 0:
             self._sources_list.addItem(t("audio_source_none"))
+
+    # ── capture target ──────────────────────────────────────────────────────
+
+    def _update_audio_target_label(self) -> None:
+        process = (self._current_settings.get("audio_target_process") or "").strip()
+        if process:
+            self._sources_target.setText(
+                t("audio_source_target_process").format(app=process)
+            )
+            self._sources_target.setStyleSheet("color: #1e8449; font-size: 11px;")
+        else:
+            self._sources_target.setText(t("audio_source_target_all"))
+            self._sources_target.setStyleSheet("color: #888; font-size: 11px;")
+
+    def _set_audio_target(self, process: str) -> None:
+        """Persist the capture target. main.py reacts through the settings signal."""
+        process = (process or "").strip()
+        self._current_settings["audio_target_process"] = process
+        self._update_audio_target_label()
+        self._auto_save()
+
+    def _capture_selected_process(self) -> None:
+        item = self._sources_list.currentItem()
+        process = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not process:
+            # Either nothing is selected, or the selected row is system sounds.
+            self._sources_status.setText(t("audio_source_pick_hint"))
+            self._sources_status.setStyleSheet("color: #c0392b; font-size: 11px;")
+            return
+        self._set_audio_target(process)
+        self._sources_status.setText(
+            t("audio_source_target_set").format(app=process)
+        )
+        self._sources_status.setStyleSheet("color: #1e8449; font-size: 11px;")
 
     def _create_translation_tab(self):
         widget = QWidget()
