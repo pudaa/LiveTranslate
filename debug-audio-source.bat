@@ -54,8 +54,8 @@ echo ---- 4 of 4: session enumeration - who is playing, on which device ---- >> 
 if /i not "%~1"=="tone" goto show
 
 echo. >> "%LOG%"
-echo ---- extra: full process-loopback capture PoC, plays a quiet tone ---- >> "%LOG%"
-"%PY%" -u "doc\migrations\poc_process_loopback.py" >> "%LOG%" 2>&1
+echo ---- extra: process loopback end-to-end (plays a quiet tone) ---- >> "%LOG%"
+"%PY%" -u "doc\migrations\check_process_loopback.py" >> "%LOG%" 2>&1
 
 :show
 echo. >> "%LOG%"

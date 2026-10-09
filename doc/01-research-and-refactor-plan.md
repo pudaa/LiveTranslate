@@ -538,11 +538,12 @@ pip install -r requirements.txt
 | P1 搬目录 | ✅ 提交 `5715bcb` |
 | P2 解耦 | ✅ 提交 `337abbe` |
 | P3 电影字幕 | ✅ 提交 `bdb0233` |
-| **P4.1 SRT 导出** | ✅ 提交 `e989090` |
-| **P4.2 内存修复** | ✅ 见 10.8（含一处**实测推翻我原判断**的记录） |
-| **P4.3 音频源过滤 A+B** | ✅ 见 10.10 |
+| **P4.1 SRT 导出** | ✅ 见 10.8（提交 `e989090`） |
+| **P4.2 内存修复** | ✅ 见 10.10（含一处**实测推翻我原判断**的记录，见 10.11） |
+| **P4.3 音频源过滤 A+B** | ✅ 见 10.6 |
+| **C 进程级 loopback** | ✅ 见 10.7**（根因找到并跑通）** |
 
-### 10.10 P4.3 音频源过滤 A+B
+### 10.6 P4.3 音频源过滤 A+B
 
 **先做的事：可行性探测（`doc/migrations/probe_audio_source.py`），而不是先写 UI。**
 
@@ -578,40 +579,54 @@ pip install -r requirements.txt
 
 **新增**：`livetranslate/audio/sessions.py`（`SessionMonitor` / `diagnose()`）、控制面板「音频源」组、`tests/test_audio_sessions.py`（23 个用例，覆盖两种设备名方言的匹配、会话标签、峰值阈值、诊断三态）、`requirements.txt += pycaw`。
 
-### 10.11 ⏸ C（进程级 loopback）—— 调查到"激活被统一拒绝"为止，未通过
+### 10.7 ✅ C（进程级 loopback）—— 根因找到并已跑通
 
-**目标**：不依赖第二个输出设备，直接按 PID 抓单个进程的音频。
+**目标**：不依赖第二个输出设备，直接按 PID 抓单个进程的音频。**已实现并端到端验证通过。**
 
-**已确认可行/已排除的（都是实测，不是推断）**
+#### 根因：完成回调必须额外实现 `IAgileObject`
 
-| 项 | 结论 |
+`ActivateAudioInterfaceAsync` 在本机对**任何**参数组合都返回 `E_ILLEGAL_METHOD_CALL (0x8000000E)`。真正的原因是：
+
+> 完成回调 COM 对象**除了 `IActivateAudioInterfaceCompletionHandler`，还必须实现 `IAgileObject`**。
+> 它是一个**无方法的空标记接口**，纯粹表示"我可以被任何 apartment 调用"。WASAPI 会专门查询这个 IID，若答 `E_NOINTERFACE`，激活就失败并返回 `E_ILLEGAL_METHOD_CALL`——**不给出任何原因提示**。
+
+**官方文档在这件事上是误导的**：它把这个错误归因于"apartment 不对"或"handler 未实现为 agile 对象（聚合 free-threaded marshaler）"。我照做实现了完整的 FTM（`IMarshal` → `CoCreateFreeThreadedMarshaler`），**完全没用**。真正被检查的是 `IAgileObject` 这个标记。
+
+**而且 apartment 根本不影响**：STA 与 MTA **都能成功**（两边都实测过）。所以本项目**不需要**碰 `CoInitializeEx` / `sys.coinit_flags`。
+
+#### 排查过程中被逐一实测排除的因素
+
+| 因素 | 排除依据 |
 |---|---|
-| Windows 版本门槛 | ✅ build 26300 ≫ 19041，支持 |
-| `ActivateAudioInterfaceAsync` 可解析 | ✅ 从 `mmdevapi` 拿得到 |
-| pycaw 提供什么 | `IAudioClient` / `WAVEFORMATEX` 有；**`IAudioCaptureClient`、异步激活接口、激活参数结构都没有** → 需自己用 comtypes/ctypes 定义 |
-| COM apartment | 已排除。`CoGetApartmentType` 确认过 STA 与 MTA 两种状态都试过；**comtypes 导入时会把线程钉成 MAIN_STA**（MTA 线程上它直接拒绝导入），已用 `sys.coinit_flags = 0` 绕开 |
-| 完成回调对象（FTM-agile） | 已排除。自己用原生 ctypes 手搭了 COM 对象（vtable + 引用计数 + `CoCreateFreeThreadedMarshaler`），**自查 QI 全部正确**（IUnknown / ICompletionHandler / IMarshal 均返回 S_OK，bogus IID 正确返回 E_NOINTERFACE）。**过程中抓到自己一个真 bug**：`ctypes.Structure` 不按值比较，`left.contents == right` 恒为 False → 导致所有 QI 都返回 E_NOINTERFACE。改成原始字节比较后修复 |
-| 参数 | 已排除。传 NULL 参数结果一致 |
-| 设备路径 | 已排除。真实渲染端点 与 `VAD\Process_Loopback` 结果一致 |
-| riid | 已排除。`IAudioClient` / `IAudioEndpointVolume`（文档列为"显式安全"）/ `ISimpleAudioVolume` / `IAudioCaptureClient` **全部同样失败** |
-| **WorkBuddy 沙箱** | 已排除。**关掉沙箱跑，结果完全相同** |
+| apartment | `CoGetApartmentType` 确认；STA / MTA 都试过，都失败（且修复后都成功） |
+| handler 的 FTM 聚合 | 用原生 ctypes 手搭完整 FTM 实现，自查 QI 全部正确，错误依旧 |
+| 参数 | NULL 参数结果一致 |
+| 设备路径 | 真实渲染端点 与 `VAD\Process_Loopback` 一致 |
+| riid | `IAudioClient` / `IAudioEndpointVolume`（文档列为"显式安全"）/ `ISimpleAudioVolume` / `IAudioCaptureClient` **全部一致失败** |
+| WorkBuddy 沙箱 | 关掉沙箱结果相同 |
+| **环境** | **老大在真实终端手动复跑，结果逐项一致** |
 
-**结论**：`ActivateAudioInterfaceAsync` 在这台机器上对**任何**参数组合都返回 `E_ILLEGAL_METHOD_CALL (0x8000000E)`。官方文档把该错误解释为"错误的 apartment"或"handler 未实现为 agile 对象"，且注明**只适用于 Windows 10 之前**——而这两个原因我都已实测排除。
+**过程中抓到自己一个真 bug**：`ctypes.Structure` **不按值比较**，`left.contents == right` 恒为 False → 手搭 COM 对象**所有 QI 都返回 E_NOINTERFACE**。改成原始字节比较后修复。
 
-**下一步的分岔**（需要老大定，不是我能靠读代码继续推的）：
-1. **用 MS 的 `ApplicationLoopback` C 示例做对照**。同一台机器上如果 C 版也失败 → 是这台机器/这个 build 的问题；如果 C 版成功 → 是我 ctypes 边界某处不对（但需要 C 编译器，且我已逐项排除了能想到的边界差异）
-2. **走 B**（接第二个输出端点 或 装 VB-CABLE）。已实现且无 COM 风险，**建议优先**
-3. 暂缓 C
+#### 实现与验证
 
-**保留的调查脚本**（可复跑）：
-- `probe_audio_source.py` —— A/B/C 三项可行性与设备枚举
-- `probe_com_apartment.py` —— apartment 状态与两种线程对比
-- `probe_activation_args.py` —— 参数级二分（含"handler 传 NULL 得 E_INVALIDARG"这一关键证据）
-- `probe_agile_handler.py` —— 原生 ctypes 的 FTM-agile 完成回调（**这个实现本身是正确的，可复用**）
+新增 `livetranslate/audio/proc_loopback.py`：
+- `IAgileObject` + `IActivateAudioInterfaceCompletionHandler` 的 COM 回调（comtypes）
+- `IAudioCaptureClient` 定义 + `ProcessLoopbackCapture`
+- **直接以 16kHz 单声道 16bit PCM 初始化**——不像端点回环必须接受设备混音格式再重采样，**热路径上零转换**（这是 ASR 恰好要的格式）
+- `PROCESS_LOOPBACK_MODE_INCLUDE/EXCLUDE_TARGET_PROCESS_TREE` 两种模式
+
+`doc/migrations/check_process_loopback.py` 实测：
+```
+抓目标进程（播放中）  : 63040 字节  rms=0.09752   ← 真实音频
+抓无关进程（静音）    : 63360 字节  rms=0.00001   ← 隔离成立
+```
+**两半缺一不可**：只测非静音只能说明"抓到了东西"；无关进程静音才证明**真的按进程隔离**——这正是用 C 而不是 B 的理由。
+
+> **实现注意**：目标进程没有音频时，回环**仍会送达填零的包**（不是没有包）。所以"收到包"不等于"有声音"，判断有声必须看样本值。
 
 
-
-### 10.6 P4.1 录制与导出 SRT
+### 10.8 P4.1 录制与导出 SRT
 
 **做法**：新增 `livetranslate/output/srt.py`（`SRTWriter`），与 `.txt` 转录**并行**写入 `transcripts/`，流式追加——播完文件即完整，中途崩溃也留下可用前缀。
 
@@ -626,7 +641,7 @@ pip install -r requirements.txt
 
 **配套**：`tests/test_srt_writer.py`（10 个用例：时间戳格式、最小时长、禁止重叠、空文本跳过、时间倒置修复、双语双行、运行时开关），以及 `verify_runtime.py` 的第 9 项——**驱动真实管线**确认 `captions` 模式**从不向翻译器提交任务**、且 SRT cue 用音频时钟落盘。
 
-### 10.7 CUDA 环境验证
+### 10.9 CUDA 环境验证
 
 `doc/migrations/check_gpu_asr.py`：加载真实 SenseVoice 到真实 GPU 并跑一次转写。这是唯一能抓到 CUDA/DLL 问题（torch 构建不对、驱动不匹配、缺 cudnn）的手段——这类问题在模型碰到设备之前完全不可见。
 
@@ -634,7 +649,7 @@ pip install -r requirements.txt
 
 > **待优化（下一轮）**：worker 冷启动 71.7s 偏长。`multiprocessing` 的 spawn 会用 `_fixup_main_from_path` **重新 import 入口 `main.py`**，而 `main.py` 顶部有 `import torch` + PyQt6——也就是说**每次起 ASR worker 都白跑一遍 GUI 的 import**。把 worker 入口挪到一个轻量模块可以省掉这部分。
 
-### 10.8 P4.2 内存修复
+### 10.10 P4.2 内存修复
 
 三处"只有长跑才暴露"的泄漏。都用回归测试钉住了（`tests/test_memory_regressions.py`）——五分钟手测完全看不出来。
 
@@ -652,9 +667,9 @@ pip install -r requirements.txt
 
 **④ 附带修掉**：`AudioCapture.__del__` 里 `if self._pa:` 在 `__init__` 未完成时（或解释器关闭阶段）会抛 `AttributeError`，被 Python 吞成噪声警告。改用 `getattr` + `try`。这是**测试跑出来的**，不是我预先想到的。
 
-### 10.9 ⚠️ 一处实测推翻的假设（保留记录）
+### 10.11 ⚠️ 一处实测推翻的假设（保留记录）
 
-我在 10.7 写过"worker 冷启动慢是因为 spawn 重新 import `main.py`（torch + PyQt6）"。**实测证明这条是错的**：
+我在 10.9 写过"worker 冷启动慢是因为 spawn 重新 import `main.py`（torch + PyQt6）"。**实测证明这条是错的**：
 
 | import | 耗时 |
 |---|---|

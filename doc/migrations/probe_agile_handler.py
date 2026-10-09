@@ -69,6 +69,13 @@ IID_COMPLETION = GUID("{41D949AB-9862-444A-80F6-C261334DA5EB}")
 IID_ASYNC_OP = GUID("{72A22D78-CDE4-431D-B8CC-843A71199B6D}")
 IID_IAUDIO_CLIENT = GUID("{1CB9AD4C-DBFA-4C32-B178-C2F568A703B2}")
 
+# The actual blocker. IAgileObject is a marker interface with NO methods: it is
+# purely the promise "you may call this object from any apartment". Implementing
+# the free-threaded marshaler (IMarshal) is NOT enough -- Windows asks for this
+# IID specifically, and answering E_NOINTERFACE makes the activation fail with
+# E_ILLEGAL_METHOD_CALL, which gives no hint as to why.
+IID_IAGILE_OBJECT = GUID("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}")
+
 # The default render device can be named directly, so the control case needs no
 # device enumeration (and therefore no comtypes).
 DEVINTERFACE_AUDIO_RENDER = "{E6327CAD-DCEC-4949-AE8A-991E976A79D2}"
@@ -185,7 +192,11 @@ class AgileHandler:
         obj = _OBJECTS.get(this)
         if obj is None or not ppv:
             return -2147467262  # E_NOINTERFACE
-        if _same_iid(riid, IID_IUNKNOWN) or _same_iid(riid, IID_COMPLETION):
+        if (
+            _same_iid(riid, IID_IUNKNOWN)
+            or _same_iid(riid, IID_COMPLETION)
+            or _same_iid(riid, IID_IAGILE_OBJECT)
+        ):
             obj._obj.refcount += 1
             ppv[0] = this
             return 0
