@@ -271,7 +271,11 @@ class ChatMessage(QWidget):
         """Update translation label with partial streaming text (throttled)."""
         self._pending_streaming = partial_text
         if not hasattr(self, "_streaming_timer"):
-            self._streaming_timer = QTimer()
+            # Parented to this widget on purpose. A parentless QTimer holds a
+            # bound-method connection back to us, which keeps the ChatMessage
+            # alive: an evicted message would never actually be freed, so the
+            # message cap would bound the layout rather than memory.
+            self._streaming_timer = QTimer(self)
             self._streaming_timer.setSingleShot(True)
             self._streaming_timer.setInterval(50)
             self._streaming_timer.timeout.connect(self._flush_streaming)
@@ -311,6 +315,24 @@ class ChatMessage(QWidget):
             self._trans_label.setText(
                 f'<span style="color:#aaa; font-style:italic;">&gt; {t("same_language")}</span>'
             )
+
+    def prepare_for_removal(self):
+        """Detach from the signal graph and the parent before deletion.
+
+        ``deleteLater()`` on its own leaves the widget parented (and painted at
+        its last geometry) until the event loop gets round to it, and an active
+        streaming timer would keep this object alive through its bound-method
+        connection regardless.
+        """
+        timer = getattr(self, "_streaming_timer", None)
+        if timer is not None:
+            timer.stop()
+            try:
+                timer.timeout.disconnect()
+            except TypeError:
+                pass  # nothing connected
+        self._pending_streaming = None
+        self.setParent(None)
 
     def hide_translation(self):
         """Drop the translation line entirely (captions mode -- there is none)."""
@@ -1185,6 +1207,7 @@ class SubtitleOverlay(QWidget):
             oldest_id = min(self._messages.keys())
             old_msg = self._messages.pop(oldest_id)
             self._msg_layout.removeWidget(old_msg)
+            old_msg.prepare_for_removal()
             old_msg.deleteLater()
 
         QTimer.singleShot(50, self._scroll_to_bottom)
@@ -1211,6 +1234,7 @@ class SubtitleOverlay(QWidget):
     def _on_clear(self):
         for msg in self._messages.values():
             self._msg_layout.removeWidget(msg)
+            msg.prepare_for_removal()
             msg.deleteLater()
         self._messages.clear()
 

@@ -538,8 +538,8 @@ pip install -r requirements.txt
 | P1 搬目录 | ✅ 提交 `5715bcb` |
 | P2 解耦 | ✅ 提交 `337abbe` |
 | P3 电影字幕 | ✅ 提交 `bdb0233` |
-| **P4.1 SRT 导出** | ✅ 见下 |
-| P4.2 内存修复 | ⏳ |
+| **P4.1 SRT 导出** | ✅ 提交 `e989090` |
+| **P4.2 内存修复** | ✅ 见 10.8（含一处**实测推翻我原判断**的记录） |
 | P4.3 音频源过滤 A+B | ⏳ |
 
 ### 10.6 P4.1 录制与导出 SRT
@@ -564,5 +564,41 @@ pip install -r requirements.txt
 实测结果：`worker ready 71.7s` → `SenseVoice loaded ... <All keys matched successfully>` → GPU 转写 1013ms。
 
 > **待优化（下一轮）**：worker 冷启动 71.7s 偏长。`multiprocessing` 的 spawn 会用 `_fixup_main_from_path` **重新 import 入口 `main.py`**，而 `main.py` 顶部有 `import torch` + PyQt6——也就是说**每次起 ASR worker 都白跑一遍 GUI 的 import**。把 worker 入口挪到一个轻量模块可以省掉这部分。
+
+### 10.8 P4.2 内存修复
+
+三处"只有长跑才暴露"的泄漏。都用回归测试钉住了（`tests/test_memory_regressions.py`）——五分钟手测完全看不出来。
+
+**① `_mic_buf` 无上限（`audio/capture.py`）**
+原代码：`_read_loop` 里 mic 数据持续 `np.concatenate` 进缓冲，靠"每次 loopback chunk 消耗等长数据"来排空。但 **loopback 流不可用时（输出设备被拔 → `loopback_audio is None` → `continue`）没有任何东西排空它**，于是整个中断期间无限增长；又因为每次 append 都是 `np.concatenate`，随着缓冲变大还会**退化到 O(n²)**。
+修：加 `MIC_BUFFER_MAX_SECONDS = 2.0` 上限，溢出时丢弃**最旧**的音频（最新的才和即将混入的 loopback chunk 对齐）。
+
+**② overlay 的 50 条消息上限其实没限制住内存（`ui/overlay.py`）**
+`ChatMessage.update_streaming` 里 `self._streaming_timer = QTimer()` —— **没有父对象**，而 `timeout.connect(self._flush_streaming)` 是**绑定方法连接**，会让这个 QTimer 持有对 ChatMessage 的强引用。结果是：被淘汰的消息**永远不会被释放**，那个"50 条上限"约束的只是 **layout 的条数，不是内存**。
+修：`QTimer(self)` 让它成为子对象，随控件一起销毁。
+
+**③ 淘汰只用了 `deleteLater()`**
+`removeWidget()` 只是从布局里摘掉，控件**仍是父控件的子对象**，会一直保留到事件循环处理 `deleteLater` 为止（期间还按旧几何位置绘制）。
+修：新增 `ChatMessage.prepare_for_removal()` —— 停掉 streaming timer、断开连接、`setParent(None)`，淘汰与清空两条路径都先调它。顺带把 `_pending_streaming` 清掉。
+
+**④ 附带修掉**：`AudioCapture.__del__` 里 `if self._pa:` 在 `__init__` 未完成时（或解释器关闭阶段）会抛 `AttributeError`，被 Python 吞成噪声警告。改用 `getattr` + `try`。这是**测试跑出来的**，不是我预先想到的。
+
+### 10.9 ⚠️ 一处实测推翻的假设（保留记录）
+
+我在 10.7 写过"worker 冷启动慢是因为 spawn 重新 import `main.py`（torch + PyQt6）"。**实测证明这条是错的**：
+
+| import | 耗时 |
+|---|---|
+| `torch` | 4.72s |
+| `PyQt6.QtWidgets` | **0.15s** |
+| **`funasr`** | **25.64s** |
+| `main`（全量，其内部含 torch） | 4.92s |
+
+PyQt6 只要 0.15s，`main.py` 相对 `import torch` 的**额外开销只有 0.2s**。真正的成本是 **funasr 的 import（25.6s）+ SenseVoice 模型初始化（~45s）**。
+
+**所以"把 worker 入口挪到轻量模块"的重构不做**——最多省 0.2s，却要把 94KB 的 `main.py` 拆开，违背"先搬目录后拆文件"的约定。**收益不成比例的重构就该砍掉。**
+
+另注：先前那次 71.7s 的测量本身也有偏差——当时 `__main__` 是 `check_gpu_asr.py`（轻量脚本），**根本没触发 main.py 被重新 import**，所以那个数字反映的是"funasr + 模型初始化"的真实成本，不含任何 main.py 开销。
+
 
 

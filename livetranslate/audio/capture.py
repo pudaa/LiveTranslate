@@ -9,6 +9,15 @@ log = logging.getLogger("LiveTranslate.Audio")
 
 DEVICE_CHECK_INTERVAL = 2.0  # seconds
 
+# Ceiling for the resampled mic buffer, in seconds of audio.
+#
+# Nothing drains this buffer while the loopback stream is down: a disconnected
+# output device leaves `loopback_audio is None`, the read loop takes the
+# `continue` early-exit, and the mic keeps appending. Without a cap it grows for
+# the entire outage -- and since every append was an np.concatenate, the cost
+# also degraded to quadratic as it grew.
+MIC_BUFFER_MAX_SECONDS = 2.0
+
 
 def list_output_devices():
     """Return list of WASAPI output device names."""
@@ -256,6 +265,21 @@ class AudioCapture:
             audio = audio[idx_floor] * (1 - frac) + audio[idx_ceil] * frac
         return audio
 
+    def _mic_buffer_push(self, chunk: np.ndarray) -> None:
+        """Append resampled mic audio, keeping the buffer under the cap.
+
+        Drops the *oldest* audio on overflow: the newest samples are the ones
+        that line up with the loopback chunk they are about to be mixed into.
+        """
+        self._mic_buf = np.concatenate([self._mic_buf, chunk])
+        overflow = self._mic_buf.size - int(self.sample_rate * MIC_BUFFER_MAX_SECONDS)
+        if overflow > 0:
+            self._mic_buf = self._mic_buf[overflow:]
+            log.debug(
+                f"Mic buffer overrun, dropped {overflow / self.sample_rate:.2f}s "
+                "(loopback stream is likely down)"
+            )
+
     def _restart_stream(self):
         """Restart stream with new default device."""
         with self._lock:
@@ -379,7 +403,7 @@ class AudioCapture:
                         mic_16k = self._resample_to_mono(
                             mic_data, self._mic_native_channels, self._mic_native_rate
                         )
-                        self._mic_buf = np.concatenate([self._mic_buf, mic_16k])
+                        self._mic_buffer_push(mic_16k)
                 except Exception as e:
                     log.warning(f"Mic read error: {e}")
 
@@ -439,5 +463,12 @@ class AudioCapture:
             return None
 
     def __del__(self):
-        if self._pa:
-            self._pa.terminate()
+        # getattr: __del__ can run when __init__ never completed (or during
+        # interpreter shutdown, after module globals are torn down), and an
+        # exception here is swallowed by Python into a noisy unraisable warning.
+        pa = getattr(self, "_pa", None)
+        if pa is not None:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
