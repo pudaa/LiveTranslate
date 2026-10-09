@@ -302,6 +302,39 @@ def _subtitle_lines():
     )
 
 
+def _subtitle_partial_line():
+    """The in-progress sentence must grow in place, not arrive once finished."""
+    from livetranslate.paths import LOGS_DIR
+    from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS, SubtitleWindow
+
+    win = SubtitleWindow(dict(DEFAULT_SUBTITLE_WIN_SETTINGS))
+    win.show()
+    _APP.processEvents()
+
+    win.update_partial("那么第三个标准")
+    _APP.processEvents()
+    assert win._partial == "那么第三个标准", win._partial
+
+    win.update_partial("那么第三个标准的划分叫做根据教育功能")
+    _APP.processEvents()
+    assert win._partial.endswith("教育功能"), win._partial
+    shown = win._text_widgets[0]._text
+    assert shown.count("那么第三个标准") == 1, f"partial accumulated instead of replacing: {shown}"
+    win._fit_height_snap()
+    _APP.processEvents()
+    win.grab().save(str(LOGS_DIR / "subtitle-partial.png"))
+
+    # Committing the sentence must clear the partial and show it exactly once.
+    win._last_insert_time = 0.0
+    win.update_text("那么第三个标准的划分叫做根据教育功能所呈现的方式的不同", {})
+    _APP.processEvents()
+    assert win._partial == "", "partial survived the commit"
+    committed = win._text_widgets[0]._text
+    assert committed.count("那么第三个标准") == 1, f"duplicated after commit: {committed}"
+    win.close()
+    return "partial replaces in place, then clears on commit without duplicating"
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -313,6 +346,7 @@ def main() -> int:
     check("6. capture target selection (C wiring)", _capture_target)
     check("7. setup wizard skips cached models", _wizard_skips_cached_models)
     check("8. subtitle lines: no duplicate, no blank gap", _subtitle_lines)
+    check("9. subtitle in-progress line grows then commits once", _subtitle_partial_line)
 
     print("PASSED:")
     for p in PASS:

@@ -507,6 +507,7 @@ class SubtitleWindow(QWidget):
     """
 
     update_text_signal = pyqtSignal(str, str)  # original, translations_json
+    partial_text_signal = pyqtSignal(str)
     position_changed = pyqtSignal()
     window_closed = pyqtSignal()
 
@@ -515,6 +516,11 @@ class SubtitleWindow(QWidget):
         self._settings = _merge_settings(DEFAULT_SUBTITLE_WIN_SETTINGS, settings)
         self._text_widgets = []
         self._sentences = []  # [(original, {lang: text, ...}), ...]
+        # The sentence currently being spoken. Live captioning has to show it
+        # growing as it is recognised; waiting for the sentence to finish means
+        # the subtitle arrives after the audio it describes, which is the one
+        # thing a live caption must not do.
+        self._partial = ""
         self._drag_pos = None
         self._bg_pixmap = None
         self._click_through = bool(self._settings.get("click_through", False))
@@ -545,6 +551,7 @@ class SubtitleWindow(QWidget):
 
         self._setup_ui()
         self.update_text_signal.connect(self._on_update_text)
+        self.partial_text_signal.connect(self._on_partial_text)
 
     @staticmethod
     def _is_pos_visible(x, y, margin=50):
@@ -850,6 +857,21 @@ class SubtitleWindow(QWidget):
         self.update_text_signal.emit(original, json.dumps(translations, ensure_ascii=False))
 
     @pyqtSlot(str, str)
+    def update_partial(self, text: str):
+        """Replace the in-progress sentence.
+
+        Called repeatedly while the speaker is still talking, so it *replaces*
+        rather than appends -- the text is expected to grow on each call.
+        """
+        self.partial_text_signal.emit(text)
+
+    @pyqtSlot(str)
+    def _on_partial_text(self, text: str):
+        self._partial = text or ""
+        self._refresh_display()
+        if self._partial:
+            self._restart_auto_hide_timer()
+
     def _on_update_text(self, original: str, translations_json: str):
         translations = json.loads(translations_json)
         self._cancel_pending_segments()
@@ -876,6 +898,8 @@ class SubtitleWindow(QWidget):
         self._sentences.append((original, translations))
         if len(self._sentences) > max_sentences:
             self._sentences = self._sentences[-max_sentences:]
+        # The committed text now covers whatever the partial line was showing.
+        self._partial = ""
 
         if self._is_hidden_by_timeout:
             self._restore_from_auto_hide()
@@ -893,7 +917,10 @@ class SubtitleWindow(QWidget):
 
 
     def _refresh_display(self):
-        if not self._sentences:
+        # The in-progress line counts as content: at the start of an utterance
+        # there are no committed sentences yet, and that is exactly when the
+        # caption most needs to be on screen.
+        if not self._sentences and not self._partial:
             for tw in self._text_widgets:
                 tw.set_text("")
             self._fit_height_snap()
@@ -910,6 +937,10 @@ class SubtitleWindow(QWidget):
 
             if line_type == "original":
                 texts = [s[0] for s in self._sentences if s[0]]
+                if self._partial:
+                    # The in-progress sentence rides at the end of the original
+                    # line, so the line grows instead of a new one appearing.
+                    texts.append(self._partial)
             else:
                 lang = cfg.get("lang", "")
                 texts = []

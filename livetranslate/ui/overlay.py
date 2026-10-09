@@ -316,6 +316,18 @@ class ChatMessage(QWidget):
                 f'<span style="color:#aaa; font-style:italic;">&gt; {t("same_language")}</span>'
             )
 
+    def set_original(self, text: str, asr_ms: float | None = None) -> None:
+        """Replace the recognized text in place.
+
+        Used for the utterance still being spoken: the line grows as the ASR
+        partials arrive, and the same message is reused for the final commit so
+        the transcript never shows the sentence twice.
+        """
+        self._original = text
+        if asr_ms is not None:
+            self._asr_ms = asr_ms
+        self._header_label.setText(self._build_header_html(self._current_style))
+
     def prepare_for_removal(self):
         """Detach from the signal graph and the parent before deletion.
 
@@ -942,6 +954,7 @@ class SubtitleOverlay(QWidget):
     update_asr_device_signal = pyqtSignal(str)
     # captions mode: this message has no translation, so drop the line entirely
     captions_only_signal = pyqtSignal(int)
+    live_message_signal = pyqtSignal(int, str, str, str, float)
 
     settings_requested = pyqtSignal()
     target_language_changed = pyqtSignal(str)
@@ -974,6 +987,7 @@ class SubtitleOverlay(QWidget):
         self.update_translation_signal.connect(self._on_update_translation)
         self.update_streaming_signal.connect(self._on_update_streaming)
         self.captions_only_signal.connect(self._on_captions_only)
+        self.live_message_signal.connect(self._on_live_message)
         self.clear_signal.connect(self._on_clear)
         self.update_monitor_signal.connect(self._on_update_monitor)
         self.update_stats_signal.connect(self._on_update_stats)
@@ -1230,6 +1244,14 @@ class SubtitleOverlay(QWidget):
         if msg:
             msg.hide_translation()
 
+    @pyqtSlot(int, str, str, str, float)
+    def _on_live_message(self, msg_id, timestamp, text, source_lang, asr_ms):
+        msg = self._messages.get(msg_id)
+        if msg is None:
+            self._on_add_message(msg_id, timestamp, text, source_lang, asr_ms)
+        else:
+            msg.set_original(text, asr_ms or None)
+
     @pyqtSlot()
     def _on_clear(self):
         for msg in self._messages.values():
@@ -1322,6 +1344,21 @@ class SubtitleOverlay(QWidget):
 
     def update_streaming(self, msg_id, partial_text):
         self.update_streaming_signal.emit(msg_id, partial_text)
+
+    def update_live(self, msg_id, timestamp, text, source_lang, asr_ms=0.0):
+        """Create or replace the message for the utterance still being spoken.
+
+        Live captioning needs the line to start growing as soon as speech does.
+        Subsequent calls replace the text; the final commit writes into the same
+        message, so the transcript never shows the sentence twice.
+        """
+        self.live_message_signal.emit(msg_id, timestamp, text, source_lang, asr_ms)
+
+    def set_message_original(self, msg_id, text, asr_ms=None):
+        """Overwrite an existing message's text (used when a live line commits)."""
+        msg = self._messages.get(msg_id)
+        if msg:
+            msg.set_original(text, asr_ms)
 
     def mark_captions_only(self, msg_id):
         """Captions mode: show the ASR text as the subtitle, with no translation

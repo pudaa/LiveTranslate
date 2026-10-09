@@ -283,13 +283,22 @@ class LiveTranslateApp:
         self._last_msg_id = 0
 
         # Incremental ASR state
-        self._incremental_enabled = False
-        self._interim_interval = 2.0
+        #
+        # On by default: the pipeline's other path only emits a segment after the
+        # VAD has seen the speaker stop, so without this the caption always
+        # arrives after the audio it describes. Interim passes let the line start
+        # growing as soon as speech does.
+        self._incremental_enabled = True
+        self._interim_interval = 0.6
         self._interim_pending = ""
         self._interim_active = False
         self._last_interim_samples = 0
         self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
+        # Overlay message id reserved for the utterance currently being spoken.
+        # Partial updates write into it and the final commit reuses it, so a
+        # sentence is never shown once as a partial and again as a final.
+        self._live_msg_id = None
 
     def set_overlay(self, overlay: SubtitleOverlay):
         self._overlay = overlay
@@ -1451,7 +1460,15 @@ class LiveTranslateApp:
         split_start = time.perf_counter()
         sentences = self._split_sentences(full_text, result["language"])
         split_ms = (time.perf_counter() - split_start) * 1000
+        # The trailing sentence is still being spoken. Surface it as a partial
+        # line so the caption starts as soon as the speaker does, rather than
+        # waiting for the VAD flush -- the old code discarded it entirely and
+        # bailed out when there was only one sentence, which meant nothing
+        # appeared until the whole utterance had finished.
+        in_progress = sentences[-1].strip() if sentences else ""
         if len(sentences) <= 1:
+            if in_progress:
+                self._emit_partial(in_progress, result["language"])
             return False
         log.debug(f"Interim split [{result['language']}] ({split_ms:.1f}ms): {len(sentences)} parts -> {sentences}")
 
@@ -1522,9 +1539,46 @@ class LiveTranslateApp:
         # Track committed text tail for echo dedup
         self._interim_committed_tail = committed_text[-50:] if len(committed_text) > 50 else committed_text
 
+        if in_progress:
+            self._emit_partial(in_progress, result["language"])
+
         self._interim_active = True
         log.info(f"Interim ASR: committed {len(complete)} sentence(s), trimmed {trim_samples / 16000:.2f}s")
         return True
+
+    def _ensure_live_message(self) -> int:
+        """Overlay message id for the utterance currently being spoken."""
+        if self._live_msg_id is None:
+            self._msg_id += 1
+            self._live_msg_id = self._msg_id
+        return self._live_msg_id
+
+    def _emit_partial(self, text: str, source_lang: str) -> None:
+        """Replace the in-progress line with ``text``.
+
+        This is what makes a live caption track the speaker. The alternative --
+        waiting for the VAD to flush the finished segment -- puts the line on
+        screen after the audio it describes, which is worse than showing nothing
+        for that stretch.
+        """
+        text = text.strip()
+        if not text:
+            return
+        if self._overlay:
+            self._overlay.update_live(
+                self._ensure_live_message(),
+                datetime.now().strftime("%H:%M:%S"),
+                text,
+                source_lang,
+                0.0,
+            )
+        if self._subwin and self._subwin.isVisible():
+            self._subwin.update_partial(text)
+
+    def _clear_partial(self) -> None:
+        """Drop the in-progress line; committed text supersedes it."""
+        if self._subwin:
+            self._subwin.update_partial("")
 
     def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0, t_end=None):
         """Output a text result (from interim or final) — similar to _process_segment but skips ASR."""
@@ -1538,13 +1592,24 @@ class LiveTranslateApp:
             return
 
         self._asr_count += 1
-        self._msg_id += 1
-        msg_id = self._msg_id
         timestamp = datetime.now().strftime("%H:%M:%S")
         log.info(f"ASR [{source_lang}] ({asr_ms:.0f}ms, interim): {original_text}")
 
-        if self._overlay:
-            self._overlay.add_message(msg_id, timestamp, original_text, source_lang, asr_ms)
+        if self._live_msg_id is not None:
+            # Reuse the live line: the sentence is already on screen, growing,
+            # so committing must not add it a second time.
+            msg_id = self._live_msg_id
+            self._live_msg_id = None
+            if self._overlay:
+                self._overlay.set_message_original(msg_id, original_text, asr_ms)
+        else:
+            self._msg_id += 1
+            msg_id = self._msg_id
+            if self._overlay:
+                self._overlay.add_message(
+                    msg_id, timestamp, original_text, source_lang, asr_ms
+                )
+        self._clear_partial()
         self._transcript.write_original(msg_id, timestamp, original_text)
         self._srt_emit(original_text, t_end=t_end)
 
@@ -1747,7 +1812,11 @@ class LiveTranslateApp:
                     elapsed = (buf_samples - self._last_interim_samples) / 16000
                     now = time.perf_counter()
                     cooldown = now - self._last_interim_check_time
-                    if total_dur >= self._interim_interval and elapsed >= self._interim_interval and cooldown >= 1.0:
+                    # Cap the cooldown by the configured interval: a hard 1s floor
+                    # meant the partial line could only advance once a second, so
+                    # a shorter interval had no effect.
+                    min_cooldown = max(0.3, min(1.0, self._interim_interval))
+                    if total_dur >= self._interim_interval and elapsed >= self._interim_interval and cooldown >= min_cooldown:
                         self._last_interim_check_time = now
                         self._enqueue_asr("interim", None)
                 continue
