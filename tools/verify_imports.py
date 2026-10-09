@@ -17,7 +17,7 @@ import ast
 import sys
 from pathlib import Path
 
-ROOT = Path.cwd()
+ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "livetranslate"
 SKIP_PARTS = {"__pycache__", "nano_src"}
 

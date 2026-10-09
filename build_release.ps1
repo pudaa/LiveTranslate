@@ -22,7 +22,8 @@ $ZipPath = Join-Path $OutDir "LiveTranslate-portable-$Tag.zip"
 
 # Files only needed for the git-clone workflow; the portable zip ships its own launcher.
 $DropList = @("install.bat", "install.ps1", "update.bat", "start.bat",
-              "build_release.ps1", "CLAUDE.md", "test_audio.py", ".gitignore", "screenshot")
+              "build_release.ps1", "CLAUDE.md", ".gitignore", "screenshot",
+              "setup-conda.ps1", "tools")
 
 # ── 1. Clean staging ──
 Write-Step "Preparing staging directory..."

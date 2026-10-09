@@ -179,7 +179,7 @@ Write-Step "4/5" "models"
 if ($SkipModels) {
     Write-Host "  skipped (-SkipModels)"
 } else {
-    & $Py (Join-Path $Root "doc\migrations\prefetch_models.py")
+    & $Py (Join-Path $Root "tools\prefetch_models.py")
     if ($LASTEXITCODE -ne 0) { Write-Warning "model pre-fetch reported a problem; the app will retry on first launch" }
 }
 
@@ -188,8 +188,9 @@ Write-Step "5/5" "self-check"
 if ($SkipVerify) {
     Write-Host "  skipped (-SkipVerify)"
 } else {
-    & $Py (Join-Path $Root "doc\migrations\verify_runtime.py")
-    & $Py (Join-Path $Root "doc\migrations\verify_ui.py")
+    & $Py (Join-Path $Root "tools\verify_imports.py")
+    & $Py (Join-Path $Root "tools\verify_runtime.py")
+    & $Py (Join-Path $Root "tools\verify_ui.py")
     & $Py -m pytest (Join-Path $Root "tests") -q
 }
 

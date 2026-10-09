@@ -522,11 +522,11 @@ pip install -r requirements.txt
 
 | 脚本 | 覆盖 | 当前结果 |
 |---|---|---|
-| `doc/migrations/verify_p1.py` | 包内导入是否全部解析（含子模块导入、被导入名是否真的定义） | 93 处 / 45 文件，0 问题 |
-| `doc/migrations/verify_runtime.py` | 全模块导入、路径锚点、注册表懒加载不拉 torch、**ASR worker 真跑一次 spawn 往返**、模式归一化、影院预设接线 | 7/7 通过 |
-| `doc/migrations/verify_ui.py` | 离屏 Qt：控制面板预设联动、字幕窗预设端到端、overlay 纯净模式与 captions 渲染 | 5/5 通过 |
+| `tools/verify_imports.py` | 包内导入是否全部解析（含子模块导入、被导入名是否真的定义） | 93 处 / 45 文件，0 问题 |
+| `tools/verify_runtime.py` | 全模块导入、路径锚点、注册表懒加载不拉 torch、**ASR worker 真跑一次 spawn 往返**、模式归一化、影院预设接线 | 7/7 通过 |
+| `tools/verify_ui.py` | 离屏 Qt：控制面板预设联动、字幕窗预设端到端、overlay 纯净模式与 captions 渲染 | 5/5 通过 |
 | `pytest tests/` | 上游自带测试 | 33 通过 |
-| `doc/migrations/prefetch_models.py` | 无需点 GUI 向导即可预下模型 | SenseVoiceSmall 897MB（ModelScope 峰值 23 MB/s） |
+| `tools/prefetch_models.py` | 无需点 GUI 向导即可预下模型 | SenseVoiceSmall 897MB（ModelScope 峰值 23 MB/s） |
 
 > **踩坑记录**：GUI 校验里 `QApplication` 若只作为函数局部变量持有，PyQt6 会回收 Python 包装对象并连带销毁底层 C++ application，之后创建任何控件都会**原生崩溃且无 traceback**（表现为 exit 127）。必须用模块级全局持有。
 
@@ -545,7 +545,7 @@ pip install -r requirements.txt
 
 ### 10.6 P4.3 音频源过滤 A+B
 
-**先做的事：可行性探测（`doc/migrations/probe_audio_source.py`），而不是先写 UI。**
+**先做的事：可行性探测，而不是先写 UI。**（当时的一次性探针脚本已随调试结束删除——结论全部保留在下面，可复跑的验证脚本在 `tools/`。）
 
 **根本约束**：WASAPI loopback 抓到的是**端点混音**，不是某个应用。想把单个进程的声音从这个混音里取出来，只有 process loopback 一条路（`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`）。所以"只录某个播放器"的可行路线是：
 
@@ -616,7 +616,7 @@ pip install -r requirements.txt
 - **直接以 16kHz 单声道 16bit PCM 初始化**——不像端点回环必须接受设备混音格式再重采样，**热路径上零转换**（这是 ASR 恰好要的格式）
 - `PROCESS_LOOPBACK_MODE_INCLUDE/EXCLUDE_TARGET_PROCESS_TREE` 两种模式
 
-`doc/migrations/check_process_loopback.py` 实测：
+`tools/verify_process_loopback.py` 实测：
 ```
 抓目标进程（播放中）  : 63040 字节  rms=0.09752   ← 真实音频
 抓无关进程（静音）    : 63360 字节  rms=0.00001   ← 隔离成立
@@ -670,7 +670,7 @@ UI 在 **设置 → VAD/ASR → 音频源**：点「刷新」列出所有会话�
 
 ### 10.9 CUDA 环境验证
 
-`doc/migrations/check_gpu_asr.py`：加载真实 SenseVoice 到真实 GPU 并跑一次转写。这是唯一能抓到 CUDA/DLL 问题（torch 构建不对、驱动不匹配、缺 cudnn）的手段——这类问题在模型碰到设备之前完全不可见。
+`tools/verify_gpu_asr.py`：加载真实 SenseVoice 到真实 GPU 并跑一次转写。这是唯一能抓到 CUDA/DLL 问题（torch 构建不对、驱动不匹配、缺 cudnn）的手段——这类问题在模型碰到设备之前完全不可见。
 
 实测结果：`worker ready 71.7s` → `SenseVoice loaded ... <All keys matched successfully>` → GPU 转写 1013ms。
 
