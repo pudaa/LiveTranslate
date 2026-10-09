@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -241,6 +242,66 @@ def _wizard_skips_cached_models():
     return "cache detected before the network was touched"
 
 
+def _subtitle_lines():
+    """Same-language / captions mode must render ONE line, not two identical ones.
+
+    main.py used to pass the ASR text as its own translation, so the subtitle
+    window drew the original and then the "translation" line with the same text
+    at a different size. It also renders a PNG so the result can be eyeballed.
+    """
+    from livetranslate.paths import LOGS_DIR
+    from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS, SubtitleWindow
+
+    win = SubtitleWindow(dict(DEFAULT_SUBTITLE_WIN_SETTINGS))
+    win.show()
+    _APP.processEvents()
+
+    orig_w, trans_w = win._text_widgets[0], win._text_widgets[1]
+
+    # Same-language case: no translation available.
+    win.update_text("那么第三个标准的划分叫做根据教育功能所呈现的方式的不同", {})
+    _APP.processEvents()
+    assert orig_w._text, "original line is empty"
+    assert not trans_w._text, f"translation line rendered the original again: {trans_w._text!r}"
+    assert trans_w.desired_height() == 0, "unused line still reserves height"
+
+    one_line_h = win._calc_target_height()
+    win._fit_height_snap()  # settle the layout; the animated fit would be mid-flight
+    _APP.processEvents()
+    win.grab().save(str(LOGS_DIR / "subtitle-one-line.png"))
+
+    # Translation present: two lines, and the window grows by one line only.
+    # Reset the pacing clock first: _on_update_text delays a replacement until
+    # _min_display_ms has elapsed, and this assertion is about rendering, not
+    # pacing (which is asserted separately below).
+    win._last_insert_time = 0.0
+    win.update_text(
+        "那么第三个标准的划分叫做根据教育功能所呈现的方式的不同", {"zh": "译文示例文本"}
+    )
+    _APP.processEvents()
+    assert orig_w._text and trans_w._text, "translated case lost a line"
+    assert trans_w.desired_height() > 0
+    two_line_h = win._calc_target_height()
+    assert two_line_h > one_line_h, "window height did not grow for the second line"
+    win._fit_height_snap()
+    _APP.processEvents()
+    win.grab().save(str(LOGS_DIR / "subtitle-two-lines.png"))
+
+    # Pacing: an update arriving immediately after the previous one is *delayed*
+    # rather than applied, which is what makes live captions lag the audio.
+    win._last_insert_time = time.monotonic() * 1000
+    win.update_text("紧接着的一句", {})
+    assert win._pending_segment_timers, "update was not paced"
+    for timer in win._pending_segment_timers:
+        timer.stop()
+
+    win.close()
+    return (
+        f"1 line when untranslated ({one_line_h}px), 2 when translated "
+        f"({two_line_h}px); PNGs in logs/"
+    )
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -251,6 +312,7 @@ def main() -> int:
     check("5. audio-source group (A) lazy build + refresh", _audio_source_panel)
     check("6. capture target selection (C wiring)", _capture_target)
     check("7. setup wizard skips cached models", _wizard_skips_cached_models)
+    check("8. subtitle lines: no duplicate, no blank gap", _subtitle_lines)
 
     print("PASSED:")
     for p in PASS:

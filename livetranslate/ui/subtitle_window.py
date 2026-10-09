@@ -62,6 +62,10 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     "auto_hide_timeout": 5,
     "auto_hide_animation": "fade",
     "auto_hide_duration": 300,
+    # Minimum time a sentence stays up before it may be replaced, in ms.
+    # Applied by delaying the replacement, so a large value makes live captions
+    # lag the audio; 0 disables the throttle.
+    "min_display_ms": 1500,
     "click_through": False,
     "lines": [
         {
@@ -394,10 +398,15 @@ class _SubtitleTextWidget(QWidget):
             self._wrapped_lines = self.split_text(self._text)
 
     def desired_height(self) -> int:
+        if not self._wrapped_lines:
+            # An unused line must not reserve space. The translation line is
+            # empty in captions / same-language mode, and giving it a full line
+            # height left a blank gap under the line that does have content --
+            # and inflated the window so it looked oversized.
+            return 0
         fm = QFontMetrics(self._font)
         ow = self._outline_width if self._outline_enabled else 0
-        n = max(len(self._wrapped_lines), 1)
-        return fm.lineSpacing() * n + ow * 2 + 4
+        return fm.lineSpacing() * len(self._wrapped_lines) + ow * 2 + 4
 
     def _update_height(self):
         self._rewrap()
@@ -523,7 +532,15 @@ class SubtitleWindow(QWidget):
         self._pending_segment_timers = []
         # Minimum display time: queue rapid updates instead of replacing instantly
         self._last_insert_time = 0.0
-        self._min_display_ms = 1500  # minimum ms before a sentence can be replaced
+        # Minimum time a sentence stays on screen before it may be replaced.
+        #
+        # A minimum duration is standard subtitle practice, but applying it by
+        # *delaying the replacement* means the display falls behind the audio:
+        # while the previous line is held, later speech has already been
+        # recognised, and when the swap finally happens the new line is longer
+        # than the utterance it describes. For live captions a short value is
+        # usually better; 0 removes the throttle entirely.
+        self._min_display_ms = int(self._settings.get("min_display_ms", 1500))
         self._height_anim = None
 
         self._setup_ui()
@@ -626,11 +643,11 @@ class SubtitleWindow(QWidget):
     def _calc_target_height(self):
         margins = self._content_layout.contentsMargins()
         spacing = self._content_layout.spacing()
-        total = margins.top() + margins.bottom()
-        for i, tw in enumerate(self._text_widgets):
-            total += tw.desired_height()
-            if i > 0:
-                total += spacing
+        # Empty lines contribute nothing, including no separator spacing.
+        heights = [h for h in (tw.desired_height() for tw in self._text_widgets) if h > 0]
+        total = margins.top() + margins.bottom() + sum(heights)
+        if len(heights) > 1:
+            total += spacing * (len(heights) - 1)
         return max(total, 20)
 
     def _fit_height_snap(self):

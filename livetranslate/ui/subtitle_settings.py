@@ -327,6 +327,7 @@ class SubtitleSettingsWidget(QWidget):
     def update_settings(self, settings: dict):
         self._settings = {**DEFAULT_SUBTITLE_WIN_SETTINGS, **(settings or {})}
         self._spacing_spin.setValue(self._settings.get("line_spacing", 8))
+        self._min_display_spin.setValue(self._settings.get("min_display_ms", 1500))
         self._width_spin.setValue(self._settings.get("window_width", 1000))
         self._bg_color_btn.set_color(self._settings.get("bg_color", "#000000"))
         self._bg_opacity_spin.setValue(round(self._settings.get("bg_opacity", 0) / 255 * 100))
@@ -391,6 +392,17 @@ class SubtitleSettingsWidget(QWidget):
         self._spacing_spin.setValue(self._settings.get("line_spacing", 8))
         self._spacing_spin.valueChanged.connect(self._on_change)
         g.addWidget(self._spacing_spin, r, 1)
+        r += 1
+
+        g.addWidget(QLabel(t("subwin_min_display")), r, 0)
+        self._min_display_spin = QSpinBox()
+        self._min_display_spin.setRange(0, 5000)
+        self._min_display_spin.setSingleStep(100)
+        self._min_display_spin.setSuffix(" ms")
+        self._min_display_spin.setToolTip(t("subwin_min_display_tip"))
+        self._min_display_spin.setValue(self._settings.get("min_display_ms", 1500))
+        self._min_display_spin.valueChanged.connect(self._on_change)
+        g.addWidget(self._min_display_spin, r, 1)
         r += 1
 
         self._bg_color_label = QLabel(t("subwin_bg_color"))
@@ -640,6 +652,7 @@ class SubtitleSettingsWidget(QWidget):
     def _emit_settings(self):
         s = {
             "line_spacing": self._spacing_spin.value(),
+            "min_display_ms": self._min_display_spin.value(),
             "window_width": self._width_spin.value(),
             "bg_color": self._bg_color_btn.color(),
             "bg_opacity": round(self._bg_opacity_spin.value() / 100 * 255),

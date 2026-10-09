@@ -1607,7 +1607,11 @@ class LiveTranslateApp:
                     self._compute_cost(),
                 )
             if self._subwin and self._subwin.isVisible():
-                self._subwin.update_text(text, {target_lang: text})
+                # No translation dict on purpose. Passing {target_lang: text}
+                # made the subtitle window render the *original* a second time in
+                # its translation line, so same-language and captions mode showed
+                # two identical lines at two different font sizes.
+                self._subwin.update_text(text, {})
             return
 
         # Collect extra languages needed by subtitle window (beyond the primary target)
@@ -1639,7 +1643,10 @@ class LiveTranslateApp:
                     except RuntimeError:
                         pass
                 else:
-                    self._subwin.update_text(text, {target_lang: text})
+                    # Same reasoning as the captions branch above: the ASR text
+                    # already is the subtitle, so there is nothing to render in
+                    # the translation line.
+                    self._subwin.update_text(text, {})
         else:
             try:
                 self._tl_executor.submit(
