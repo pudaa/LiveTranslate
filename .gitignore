@@ -14,7 +14,8 @@ __pycache__/
 /logs/
 /docs/
 /transcripts/
-/user_settings.json
+# Runtime settings, plus any .bak-* copy taken before editing them by hand.
+/user_settings.json*
 
 # IDE
 .vscode/
