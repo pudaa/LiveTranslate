@@ -375,11 +375,53 @@ def _subtitle_marquee():
     # A pause shows up as blank width, and is capped so a long silence cannot
     # scroll the whole line away.
     cap = DEFAULT_SUBTITLE_WIN_SETTINGS["pause_gap_max_px"]
-    win._last_commit_time = _time.monotonic() - 60.0
+    win._last_text_at = _time.monotonic() - 60.0
     assert win._pause_gap_px() == cap, "the pause gap is not capped"
 
     win.close()
     return f"one row ({one_row}px), trimmed to {len(shown)} chars from the front, gap cap {cap}px"
+
+
+def _subtitle_marquee_animation():
+    """The pause must stop widening once speech resumes, and text must slide in."""
+    import time as _time
+
+    from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS, SubtitleWindow
+
+    win = SubtitleWindow(dict(DEFAULT_SUBTITLE_WIN_SETTINGS))
+    win.show()
+    _APP.processEvents()
+
+    win._last_insert_time = 0.0
+    win._insert_sentence("第一句话", {})
+    win._last_text_at = _time.monotonic() - 1.0
+    gap_silent = win._pause_gap_px()
+    assert gap_silent > 0, "silence produced no gap at all"
+
+    # Speech resumes: the gap has to freeze. A gap that keeps widening while the
+    # next sentence is on screen reads as talking and pausing at once.
+    win.update_partial("第二句")
+    _APP.processEvents()
+    frozen = win._pause_gap_px()
+    win._last_text_at = _time.monotonic() - 5.0  # pretend more silence passed
+    assert win._pause_gap_px() == frozen, (
+        "the gap kept widening after the next sentence had already appeared"
+    )
+
+    # Arriving text is parked to the right and animated in, not teleported.
+    before = win._slide_px
+    win.update_partial("第二句话变得更长了一些")
+    _APP.processEvents()
+    parked = win._slide_px
+    assert parked > before, "new text was not given an insertion offset"
+
+    # ...and that offset decays, so the line travels instead of jumping.
+    win._last_tick = _time.monotonic() - 0.05
+    win._tick_marquee()
+    assert win._slide_px < parked, "the insertion offset did not animate down"
+
+    win.close()
+    return f"gap froze at {frozen:.0f}px, {parked:.0f}px of new text slides in"
 
 
 def main() -> int:
@@ -395,6 +437,7 @@ def main() -> int:
     check("8. subtitle lines: no duplicate, no blank gap", _subtitle_lines)
     check("9. subtitle in-progress line grows then commits once", _subtitle_partial_line)
     check("10. subtitle marquee: one row, trims from the front", _subtitle_marquee)
+    check("11. marquee gap freezes; new text slides in", _subtitle_marquee_animation)
 
     print("PASSED:")
     for p in PASS:

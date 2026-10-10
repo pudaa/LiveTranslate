@@ -9,6 +9,7 @@ Usage:
 """
 
 import ctypes
+import re
 import time
 from pathlib import Path
 
@@ -70,6 +71,10 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # Pause width standing in for the silence that followed a sentence.
     "pause_gap_px_per_s": 70.0,
     "pause_gap_max_px": 170.0,
+    # How fast newly arrived text slides in from the right, in px/s. Fast enough
+    # to keep up with speech, slow enough that the eye can follow the line rather
+    # than see it jump.
+    "scroll_speed_px_per_s": 900.0,
     # Minimum time a sentence stays up before it may be replaced, in ms.
     # Applied by delaying the replacement, so a large value makes live captions
     # lag the audio; 0 disables the throttle.
@@ -136,6 +141,48 @@ def _hex_to_rgba(hex_color: str, opacity: int) -> str:
     return f"rgba({r},{g},{b},{opacity})"
 
 
+_CJK_CHAR = re.compile(
+    r"[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]"
+)
+_LATIN_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9'\u2019_\-]*")
+
+
+def split_marquee_units(text: str) -> list:
+    """Split text into the units the marquee advances and fades as blocks.
+
+    The unit has to match how the language is read. A CJK character is a whole
+    word, so one character per unit is right. Latin script is read per word:
+    advancing half a word looks like a glitch, and a word that straddles the
+    fade zone would half-dissolve. Drawing a whole word as one path also keeps
+    its kerning and shaping intact, which per-character drawing would break.
+
+    Trailing spaces ride along with the word so a line never starts with one.
+    """
+    units: list = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if _CJK_CHAR.match(ch):
+            # Keep trailing CJK punctuation with its character, so a full stop
+            # never fades out on its own.
+            j = i + 1
+            while j < n and text[j] in "\u3002\uff0c\u3001\uff1b\uff1a\uff01\uff1f\u201d\u300d\u300f":
+                j += 1
+            units.append(text[i:j])
+            i = j
+        elif _LATIN_WORD.match(ch):
+            j = _LATIN_WORD.match(text, i).end()
+            while j < n and text[j] in " \t":
+                j += 1
+            units.append(text[i:j])
+            i = j
+        else:
+            units.append(ch)
+            i += 1
+    return units
+
+
 class _SubtitleTextWidget(QWidget):
     """Renders outlined text using QPainterPath, with automatic word-wrap.
     Supports entry/exit animations via custom properties.
@@ -174,6 +221,9 @@ class _SubtitleTextWidget(QWidget):
         # ever jumps sideways. See set_marquee().
         self._scroll_mode = False
         self._marquee: list[list] = []  # [[text, gap_px_after], ...]
+        # Insertion offset: newly arrived text is parked this far to the right and
+        # animated back to zero, so it slides in instead of teleporting.
+        self._marquee_slide_px = 0.0
         self._fade_out_px = 96
 
     # --- pyqtProperty for content opacity ---
@@ -414,7 +464,7 @@ class _SubtitleTextWidget(QWidget):
 
         return segments or [text]
 
-    def set_marquee(self, items: list) -> None:
+    def set_marquee(self, items: list, slide_px: float = 0.0) -> None:
         """Render a single, non-wrapping, right-anchored line.
 
         ``items`` is ``[[text, gap_px_after], ...]``. The gap after a segment is
@@ -426,6 +476,7 @@ class _SubtitleTextWidget(QWidget):
         fixed place and the older words are what moves.
         """
         self._marquee = [[str(t), float(g or 0.0)] for t, g in items]
+        self._marquee_slide_px = float(slide_px or 0.0)
         self._text = "".join(t for t, _ in self._marquee)
         self._wrapped_lines = [self._text] if self._text else []
         self._pending_text = None
@@ -435,12 +486,14 @@ class _SubtitleTextWidget(QWidget):
 
     def marquee_width(self) -> float:
         """Rendered width of the whole marquee, gaps included."""
-        if not self._scroll_mode or not self._marquee:
+        if not self._marquee:
             return 0.0
         fm = QFontMetrics(self._font)
         total = 0.0
         for text, gap in self._marquee:
-            total += fm.horizontalAdvance(text) + gap
+            for unit in split_marquee_units(str(text)):
+                total += fm.horizontalAdvance(unit)
+            total += gap
         return total
 
     def _rewrap(self):
@@ -526,26 +579,27 @@ class _SubtitleTextWidget(QWidget):
 
         # Right-anchored: the end of the line is pinned to the right edge, so the
         # newest words land in a fixed place and the older ones travel left.
-        x = float(w - ow - self.marquee_width())
+        x = float(w - ow - self.marquee_width() + self._marquee_slide_px)
         for text, gap in self._marquee:
-            for ch in text:
-                self._draw_marquee_char(painter, fm, ch, snap(x), baseline, outline_pen)
-                x += fm.horizontalAdvance(ch)
+            for unit in split_marquee_units(str(text)):
+                self._draw_marquee_unit(painter, fm, unit, snap(x), baseline, outline_pen)
+                x += fm.horizontalAdvance(unit)
             x += gap
 
         painter.end()
         self._text_cache = pix
 
-    def _draw_marquee_char(self, painter, fm, ch, x, baseline, outline_pen):
-        """Draw one character, fading it out as it passes the left edge.
+    def _draw_marquee_unit(self, painter, fm, unit, x, baseline, outline_pen):
+        """Draw one reading unit, fading it out as it passes the left edge.
 
-        Per character rather than per path because the alpha varies along the
-        line. CJK has no shaping to lose; for Latin scripts the kerning between
-        adjacent glyphs is sacrificed, which is the price of a soft left edge.
+        The unit -- a CJK character, or a whole Latin word -- is drawn as a
+        single path. Per character would break Latin kerning and would let a
+        word dissolve half at a time, which reads as a rendering fault rather
+        than as text leaving.
         """
-        if not ch.strip():
+        if not unit.strip():
             return
-        cw = fm.horizontalAdvance(ch)
+        cw = fm.horizontalAdvance(unit)
         if x + cw <= -self._fade_out_px:
             return  # fully past the fade zone
         if x >= 0:
@@ -556,7 +610,7 @@ class _SubtitleTextWidget(QWidget):
             return
 
         path = QPainterPath()
-        path.addText(x, baseline, self._font, ch)
+        path.addText(x, baseline, self._font, unit)
 
         if outline_pen is not None:
             painter.setPen(outline_pen)
@@ -677,10 +731,18 @@ class SubtitleWindow(QWidget):
         # character, so the reader sees time pass instead of punctuation.
         self._gaps: list[float] = []
         self._live_gap_px = 0.0
-        self._last_commit_time = 0.0
-        self._gap_timer = QTimer(self)
-        self._gap_timer.setInterval(100)
-        self._gap_timer.timeout.connect(self._grow_pause_gap)
+        # When the most recent text arrived, and the pause width fixed at the
+        # moment speech resumed (None while the speaker is still silent).
+        self._last_text_at = 0.0
+        self._frozen_gap = None
+        # Insertion offset for newly arrived text, eased to zero by the animation
+        # timer, plus the last measured text width so a growth can be detected.
+        self._slide_px = 0.0
+        self._last_text_width = 0.0
+        self._last_tick = 0.0
+        self._marquee_timer = QTimer(self)
+        self._marquee_timer.setInterval(16)  # ~60fps
+        self._marquee_timer.timeout.connect(self._tick_marquee)
         self._drag_pos = None
         self._bg_pixmap = None
         self._click_through = bool(self._settings.get("click_through", False))
@@ -1035,11 +1097,20 @@ class SubtitleWindow(QWidget):
 
     @pyqtSlot(str)
     def _on_partial_text(self, text: str):
-        self._partial = text or ""
-        self._refresh_display()
+        text = text or ""
+        appeared = bool(text) and not self._partial
+        self._partial = text
+        if appeared:
+            # Speech resumed. Fix the pause that preceded it here, or the gap
+            # would go on widening while the words are already on screen.
+            self._mark_text_arrived()
         if self._partial:
             self._restart_auto_hide_timer()
-            self._start_gap_timer()
+        # Content changed, so re-render through the normal path: that is also
+        # where the insertion offset gets compensated.
+        self._refresh_display()
+        if self._partial:
+            self._start_marquee()
 
     def _on_update_text(self, original: str, translations_json: str):
         translations = json.loads(translations_json)
@@ -1073,15 +1144,17 @@ class SubtitleWindow(QWidget):
                 self._sentences = self._sentences[-max_sentences:]
         else:
             # The pause that just ended belongs to the sentence before this one.
+            silence = self._pause_gap_px()
             if self._gaps:
-                self._gaps[-1] = self._live_gap_px
+                self._gaps[-1] = silence
             while len(self._gaps) < len(self._sentences):
                 self._gaps.append(0.0)
         self._live_gap_px = 0.0
-        self._last_commit_time = time.monotonic()
+        self._frozen_gap = None
+        self._last_text_at = time.monotonic()
         # The committed text now covers whatever the partial line was showing.
         self._partial = ""
-        self._start_gap_timer()
+        self._start_marquee()
 
         if self._is_hidden_by_timeout:
             self._restore_from_auto_hide()
@@ -1106,34 +1179,105 @@ class SubtitleWindow(QWidget):
         return None
 
     def _pause_gap_px(self) -> float:
-        """Blank width representing the silence since the last commit."""
+        """Blank width for the silence currently on display.
+
+        Frozen once text is arriving: a gap that keeps widening after the next
+        sentence is already on screen reads as the speaker both talking and
+        pausing at the same time.
+        """
         rate = float(self._settings.get("pause_gap_px_per_s", 70.0))
         cap = float(self._settings.get("pause_gap_max_px", 170.0))
-        if self._last_commit_time <= 0:
+        if self._partial and self._frozen_gap is not None:
+            return self._frozen_gap
+        if self._last_text_at <= 0:
             return 0.0
-        return min(cap, (time.monotonic() - self._last_commit_time) * rate)
+        return min(cap, (time.monotonic() - self._last_text_at) * rate)
 
-    def _grow_pause_gap(self) -> None:
-        """Let the tail gap widen as time passes.
+    def _mark_text_arrived(self) -> None:
+        """New text landed: the pause is over, so fix its width and restart the
+        clock for the pause that comes after."""
+        if self._frozen_gap is None and self._last_text_at > 0:
+            self._frozen_gap = self._pause_gap_px()
+        self._last_text_at = time.monotonic()
 
-        This is what makes a pause visible: with nothing being said there are no
-        new words to push the line along, so the gap itself does the pushing and
-        the caption keeps travelling left. Capped, or a long silence would
-        scroll the whole line off and leave a blank bar.
+    def _tick_marquee(self) -> None:
+        """One animation frame.
+
+        The line's position is animated rather than derived from the content.
+        Deriving it means every arriving chunk of text teleports the line by that
+        chunk's width, which is what made the motion read as a stutter.
         """
-        if not self._sentences and not self._partial:
-            self._gap_timer.stop()
-            return
-        gap = self._pause_gap_px()
-        if abs(gap - self._live_gap_px) < 1.0:
-            self._gap_timer.stop()  # saturated at the cap
-            return
-        self._live_gap_px = gap
-        self._refresh_display()
+        now = time.monotonic()
+        dt = max(0.0, min(0.1, now - self._last_tick))
+        self._last_tick = now
 
-    def _start_gap_timer(self) -> None:
-        if self._scroll_line_config() and not self._gap_timer.isActive():
-            self._gap_timer.start()
+        moved = False
+        if self._slide_px > 0.0:
+            speed = float(self._settings.get("scroll_speed_px_per_s", 900.0))
+            self._slide_px = max(0.0, self._slide_px - speed * dt)
+            moved = True
+            if self._slide_px == 0.0:
+                # Snap the final frame so the line settles on an exact position.
+                self._render_marquee()
+                return
+
+        gap = self._pause_gap_px()
+        if abs(gap - self._live_gap_px) >= 0.5:
+            self._live_gap_px = gap
+            moved = True
+
+        if not moved:
+            self._marquee_timer.stop()
+            return
+        self._render_marquee()
+
+    def _start_marquee(self) -> None:
+        if self._scroll_line_config() is None:
+            return
+        self._last_tick = time.monotonic()
+        if not self._marquee_timer.isActive():
+            self._marquee_timer.start()
+
+    def _enabled_lines(self) -> list:
+        return [ln for ln in self._settings.get("lines", []) if ln.get("enabled", True)]
+
+    def _render_marquee(self) -> None:
+        """Repaint the scrolling lines only; this runs on every animation frame."""
+        for wi, cfg in enumerate(self._enabled_lines()):
+            if wi >= len(self._text_widgets):
+                break
+            tw = self._text_widgets[wi]
+            if not (cfg.get("scroll") and tw._scroll_mode):
+                continue
+            tw.set_marquee(
+                self._marquee_items(cfg.get("type", "original"), cfg), self._slide_px
+            )
+
+    def _compensate_insertion(self) -> None:
+        """Park newly arrived text off to the right for the animation to carry in.
+
+        Without this the whole line jumps left by the width of every new chunk.
+        Only *text* growth is compensated -- the pause gap is meant to push the
+        line along, since that is what shows time passing.
+        """
+        width = self._marquee_text_width()
+        if self._last_text_width and width > self._last_text_width:
+            self._slide_px += width - self._last_text_width
+        self._last_text_width = width
+
+    def _marquee_text_width(self) -> float:
+        """Width of the marquee's text, excluding the pause gaps."""
+        tw = self._text_widgets[0] if self._text_widgets else None
+        if tw is None:
+            return 0.0
+        fm = QFontMetrics(tw._font)
+        total = 0.0
+        for original in (s[0] for s in self._sentences):
+            for unit in split_marquee_units(original):
+                total += fm.horizontalAdvance(unit)
+        for unit in split_marquee_units(self._partial):
+            total += fm.horizontalAdvance(unit)
+        return total
 
     def _marquee_items(self, line_type: str, cfg: dict) -> list:
         """Build ``[[text, gap_px_after], ...]`` for one scroll-mode line."""
@@ -1147,7 +1291,9 @@ class SubtitleWindow(QWidget):
                 continue
             gap = self._gaps[i] if i < len(self._gaps) else 0.0
             if i == len(self._sentences) - 1:
-                gap = self._live_gap_px  # the tail gap is still growing
+                # The silence on display right now: it widens until speech
+                # resumes, then stops.
+                gap = self._pause_gap_px()
             items.append([text, gap])
         if self._partial:
             items.append([self._partial, 0.0])
@@ -1221,7 +1367,8 @@ class SubtitleWindow(QWidget):
                 if line_type == "original":
                     self._trim_marquee(tw)
                     items = self._marquee_items(line_type, cfg)
-                tw.set_marquee(items)
+                    self._compensate_insertion()
+                tw.set_marquee(items, self._slide_px)
                 wi += 1
                 continue
 
@@ -1267,7 +1414,11 @@ class SubtitleWindow(QWidget):
         self._gaps.clear()
         self._partial = ""
         self._live_gap_px = 0.0
-        self._gap_timer.stop()
+        self._frozen_gap = None
+        self._last_text_at = 0.0
+        self._slide_px = 0.0
+        self._last_text_width = 0.0
+        self._marquee_timer.stop()
         self._cancel_pending_segments()
         self._auto_hide_timer.stop()
         self._is_hidden_by_timeout = False

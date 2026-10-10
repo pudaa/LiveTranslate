@@ -36,3 +36,8 @@ dist/
 build/
 release/
 *.egg-info/
+
+# The packaged exe is built into the project root so it reuses the existing
+# config.yaml / user_settings.json / models/ -- do not commit the binary.
+/LiveTranslate.exe
+/LiveTranslate.prev-*

@@ -32,12 +32,19 @@ from livetranslate.models.manager import (
     resolve_custom_whisper_model,
 )
 
-from livetranslate.paths import CONFIG_FILE, LOGS_DIR, TRANSCRIPTS_DIR
+from livetranslate.paths import (
+    CONFIG_FILE,
+    LOGS_DIR,
+    TRANSCRIPTS_DIR,
+    ensure_runtime_files,
+)
 
 # Set cache env BEFORE importing torch so TORCH_HOME is respected
 apply_cache_env()
 
 import os
+
+log = logging.getLogger("LiveTranslate")
 
 # torch must be imported before PyQt6 to avoid DLL conflicts on Windows
 import torch  # noqa: F401
@@ -1887,7 +1894,36 @@ class LiveTranslateApp:
                 break
 
 
+def _run_frozen_probe():
+    """Execute ``LIVETRANSLATE_PROBE`` source and print a JSON report.
+
+    A packaged build fails in ways a source run never does (missing DLL, a
+    writable-dir assumption that breaks under a read-only install, an ASR
+    worker that cannot re-enter a frozen exe). Those need a headless way in,
+    so ``tools/verify_frozen.py`` sets the env var and this runs instead of
+    the GUI. Never reachable from the normal UI.
+    """
+    source = os.environ.get("LIVETRANSLATE_PROBE")
+    if not source:
+        return False
+    import json
+
+    scope: dict = {"__name__": "__frozen_probe__", "__file__": str(Path(sys.executable))}
+    exec(compile(source, "<frozen-probe>", "exec"), scope)  # noqa: S102
+    # The probe prints its own report; make sure nothing buffered it.
+    sys.stdout.flush()
+    return True
+
+
 def main():
+    if _run_frozen_probe():
+        return 0
+
+    # Must precede setup_logging(): a frozen build starts with no runtime
+    # dirs at all, and LOGS_DIR.mkdir() only creates the last path segment.
+    for note in ensure_runtime_files():
+        log.info(f"runtime setup: {note}")
+
     setup_logging()
     log.info("LiveTranslate starting...")
     config = load_config()
