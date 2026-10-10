@@ -81,6 +81,12 @@ def defined_names(path: Path) -> set[str]:
                     for t in sub.targets:
                         if isinstance(t, ast.Name):
                             names.add(t.id)
+                elif isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name):
+                    # Annotated assignment, e.g. `APP_ROOT: Path = ...`. Easy to
+                    # miss, and paths.py defines APP_ROOT that way inside an
+                    # if/else for frozen builds -- which made this checker report
+                    # a module as broken when it was fine.
+                    names.add(sub.target.id)
                 elif isinstance(sub, ast.ImportFrom):
                     for a in sub.names:
                         names.add(a.asname or a.name.split(".")[0])
