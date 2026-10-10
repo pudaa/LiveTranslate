@@ -1490,13 +1490,18 @@ class SubtitleWindow(QWidget):
         # Release one reading unit at a time from whatever has been buffered.
         moved = self._release_step(dt)
 
-        if self._slide_px > 0.0:
+        # Decay in both directions. The guard here used to be `> 0.0`, which was
+        # fine while only growth was compensated -- but a shrink compensates with a
+        # *negative* offset, and a negative one was never decayed at all. Each
+        # correction then walked the line further left, permanently: six of them
+        # accumulated -540px, which is off the screen entirely.
+        if self._slide_px != 0.0:
             # Exponential settle rather than a fixed speed: the offset is always
             # about one reading unit wide, and a time constant absorbs each step
             # smoothly no matter how big it is or how fast they arrive.
             tau = max(0.02, float(self._settings.get("slide_settle_ms", 90)) / 1000.0)
             self._slide_px *= math.exp(-dt / tau)
-            if self._slide_px < 0.5:
+            if abs(self._slide_px) < 0.5:
                 self._slide_px = 0.0
             moved = True
 

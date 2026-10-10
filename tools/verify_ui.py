@@ -624,6 +624,25 @@ def _subtitle_anchor_and_revision():
         shown = "".join(t for t, _ in tw._marquee)
         assert "\u3000" not in shown, f"a correction left padding behind: {shown!r}"
 
+    # The insertion offset must decay in *both* directions. It only decayed while
+    # positive, so a correction -- which compensates a shrink with a negative
+    # offset -- walked the line steadily left instead of easing: six corrections
+    # accumulated -540px and pushed the caption off the screen.
+    win.clear()
+    offsets = []
+    for index in range(6):
+        win.update_partial("这是一段比较长的测试文本用来观察偏移" + "啊" * (index + 1))
+        _release_all(win)
+        win.update_partial("这是一段比较长的测试文本用来观察偏移")  # shorter
+        _release_all(win)
+        for _ in range(30):
+            win._last_tick = time.monotonic() - 0.016
+            win._tick_marquee()
+        offsets.append(round(win._slide_px, 1))
+    assert all(abs(o) < 5.0 for o in offsets), (
+        f"the insertion offset accumulated across corrections: {offsets}"
+    )
+
     # The replacement must still be paced, not swapped in wholesale.
     win.clear()
     win.update_partial("教育价值它是教育应该干什么呢啊")
