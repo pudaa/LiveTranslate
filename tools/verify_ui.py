@@ -606,36 +606,32 @@ def _subtitle_anchor_and_revision():
     _release_all(win)
     assert win._slide_px == 0.0, f"a one-unit release was parked ({win._slide_px:.0f}px)"
 
-    # The width must hold for the *whole* correction, not just at its end. The
-    # replacement types in behind reserved space that is consumed as it arrives,
-    # so the line does not move at any point in the operation.
+    # A correction must leave nothing behind in the line. An earlier design padded
+    # the replacement out to the width of what it replaced so the line would not
+    # shift; each correction then left a permanent hole, and the holes accumulated
+    # across corrections until a quarter of the container was blank. Guarded here.
     from PyQt6.QtGui import QFontMetrics
 
     tw = win._text_widgets[0]
-    line_width = lambda: QFontMetrics(tw._font).horizontalAdvance(
-        "".join(t for t, _ in tw._marquee)
-    )
     win.clear()
-    win.update_partial("教育价值它是教育应该干什么啊")
-    _release_all(win)
-    before = line_width()
-    win.update_partial("教育价值他是教育应该干什么")  # one character shorter
-    widths = [line_width()]
-    for _ in range(120):
-        if win._release_step(0.016):
-            win._render_marquee()
-        widths.append(line_width())
-        if not win._release_queue:
-            break
-    distinct = sorted({round(w) for w in widths})
-    assert len(distinct) == 1, f"the width varied during the correction: {distinct}"
-    assert abs(widths[-1] - before) < 0.5, f"ended {widths[-1] - before:+.0f}px off"
+    for index in range(4):
+        win.update_partial(f"这是第{index + 1}句话它是教育应该干什么呢啊")
+        _release_all(win)
+        win.update_partial(f"这是第{index + 1}句话他是教育")  # a correction, shorter
+        _release_all(win)
+        win.update_text(f"这是第{index + 1}句话他是教育", {})
+        _APP.processEvents()
+        shown = "".join(t for t, _ in tw._marquee)
+        assert "\u3000" not in shown, f"a correction left padding behind: {shown!r}"
 
-    # The padding must sit inside the line, not trail at the right edge where it
-    # reads as the caption failing to keep up.
-    tail = "".join(t for t, _ in tw._marquee)
-    assert not tail.endswith("\u3000"), "padding is trailing at the right edge"
-    assert "\u3000" in tail, "a shorter correction left no padding at all"
+    # The replacement must still be paced, not swapped in wholesale.
+    win.clear()
+    win.update_partial("教育价值它是教育应该干什么呢啊")
+    _release_all(win)
+    win.update_partial("教育价值他是教育")
+    assert win._release_queue, "a revision was not queued, so it would appear at once"
+    _release_all(win)
+    assert win._released_tail == "教育价值他是教育", win._released_tail
 
     # A corrected unit materialises from a partly visible value, not from nothing.
     # Starting from nothing is the cue that means "this is new", and confusing the
@@ -647,7 +643,7 @@ def _subtitle_anchor_and_revision():
     win.close()
     return (
         "bottom edge held; revision replaced in place; one-unit release not parked; "
-        f"{before:.0f}px held through a 3-character correction"
+        "no padding left behind over 4 corrections"
     )
 
 
