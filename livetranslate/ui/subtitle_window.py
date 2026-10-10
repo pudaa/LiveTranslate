@@ -106,6 +106,9 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # A just-corrected unit materialises from correction_fade_from to full over
     # correction_fade_in_ms. Starting partly visible, rather than from nothing, is
     # what keeps it distinguishable from genuinely new text.
+    # A revision bigger than this is swapped in place with no marker at all: it is
+    # a rewrite rather than a correction, and marking half the line helps nobody.
+    "correction_fade_max_units": 3,
     "correction_fade_in_ms": 320,
     "correction_fade_from": 0.45,
     # Minimum time a sentence stays up before it may be replaced, in ms.
@@ -1011,7 +1014,11 @@ class SubtitleWindow(QWidget):
         # Content area
         self._content = QWidget()
         self._content.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        # The window is bottom-anchored, so the text inside it must be too:
+        # otherwise the line rides at the top of a box whose top edge is what
+        # moves, and it appears to float upward whenever the height changes.
         self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.addStretch(1)
         self._content_layout.setContentsMargins(16, 8, 16, 8)
         self._content_layout.setSpacing(s.get("line_spacing", 8))
 
@@ -1432,19 +1439,39 @@ class SubtitleWindow(QWidget):
         # to the left. Almost every length-changing replacement is a plain append,
         # which needs no protection anyway; for a genuine revision a brief shift,
         # eased by the slide, is the lesser cost.
+        previous = self._released_tail
         keep = 0
-        common = min(len(text), len(self._released_tail))
-        while keep < common and text[keep] == self._released_tail[keep]:
+        common = min(len(text), len(previous))
+        while keep < common and text[keep] == previous[keep]:
             keep += 1
+        # Also take the common *suffix*. Without it the "changed" span is
+        # everything after the first difference -- for a one-character fix in a
+        # long sentence that is the whole rest of the line, so a one-character
+        # correction was treated as a rewrite and left unmarked.
+        tail = 0
+        while (
+            tail < common - keep
+            and text[len(text) - 1 - tail] == previous[len(previous) - 1 - tail]
+        ):
+            tail += 1
 
-        changed_new = text[keep:]
-        self._released_tail = text[:keep]
-        self._display_tail = text[:keep]
-        self._release_queue = changed_new
+        changed_new = text[keep:len(text) - tail]
+        # Swap in place, at once. Queuing the replacement like ordinary text made
+        # it re-enter with a fade, so a large correction read as the whole sentence
+        # flashing back in -- the opposite of what a correction should look like,
+        # and because the reader has just read that sentence it is very visible.
+        self._released_tail = text
+        self._display_tail = text
+        self._release_queue = ""
         self._release_credit = 0.0
-        self._mark_correction(
-            len(split_marquee_units(changed_new)), len(split_marquee_units(changed_new))
-        )
+
+        # Mark it only when the change is small enough for the mark to mean
+        # "these few characters were revised". A large rewrite is not a correction
+        # the reader can use a marker for; an underline under half the line is just
+        # noise, and the change is evident on its own.
+        units_new = len(split_marquee_units(changed_new))
+        if units_new <= int(self._settings.get("correction_fade_max_units", 3)):
+            self._mark_correction(units_new, units_new)
 
     def _release_step(self, dt: float) -> bool:
         """Show at most a little more of the buffered text. True if anything moved.
@@ -1647,10 +1674,19 @@ class SubtitleWindow(QWidget):
         return None
 
     def _belt_rest_x(self, tw) -> float:
-        """Where the newest character rests: the right edge, inside the outline."""
+        """Where the newest character comes to rest.
+
+        Not flush with the right edge: it rests slightly *past* it, so a character
+        enters where it cannot be seen and is carried into view by the drift. That
+        is what gives new text an entrance rather than having it appear already
+        inside the container.
+        """
         cfg = self._scroll_line_config() or {}
         ow = max(1, int(cfg.get("outline_width", 1)))
-        return float(tw.width() - 2 * ow)
+        entry = max(0.0, float(self._settings.get("entry_margin_px", 0.0)))
+        if entry <= 0.0:
+            entry = self._typical_unit_px()          # default: one reading unit
+        return float(tw.width() - 2 * ow) + entry
 
     def _marquee_content_width(self) -> float:
         """Width of the whole line, pause gaps included."""
@@ -1771,7 +1807,16 @@ class SubtitleWindow(QWidget):
         return max(0.0, 1.0 - (elapsed - hold) / fade)
 
     def _mark_content(self) -> None:
-        """Note that the line just gained content, holding the stale fade off."""
+        """Note that the line just gained content, holding the stale fade off.
+
+        If the line had *already* begun to fade, it is discarded rather than
+        brought back. Resetting the clock alone would restore the old text to full
+        strength the moment the speaker resumed, so the reader would have to work
+        out which part is new -- exactly the interference the fade exists to
+        prevent. Text that has started to go does not come back.
+        """
+        if self._stale_alpha() < 1.0:
+            self.clear()
         self._stale_at = time.monotonic()
 
     def _advance_belt(self, dt: float) -> bool:

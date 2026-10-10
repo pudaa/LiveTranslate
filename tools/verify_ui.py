@@ -705,14 +705,30 @@ def _subtitle_anchor_and_revision():
         positions.append(win._belt_x)
     assert len(set(round(x, 3) for x in positions)) > 1, "the belt never advanced"
 
-    # The replacement must still be paced, not swapped in wholesale.
+    # A revision is swapped in place, not queued. Queuing it made the replacement
+    # re-enter with a fade, so a large correction read as the whole sentence
+    # flashing back in -- reported from use.
     win.clear()
     win.update_partial("教育价值它是教育应该干什么呢啊")
     _release_all(win)
     win.update_partial("教育价值他是教育")
-    assert win._release_queue, "a revision was not queued, so it would appear at once"
-    _release_all(win)
+    assert not win._release_queue, f"a revision was queued: {win._release_queue!r}"
     assert win._released_tail == "教育价值他是教育", win._released_tail
+    assert win._display_tail == "教育价值他是教育", win._display_tail
+
+    # A small revision is marked; a rewrite is not. An underline across half the
+    # line is noise, and a rewrite is evident without one.
+    win.clear()
+    win.update_partial("教育价值它是教育应该干什么呢啊")
+    _release_all(win)
+    win.update_partial("教育价值他是教育应该干什么呢啊")  # one character changed
+    assert win._live_corrections(), "a small revision was not marked"
+
+    win.clear()
+    win.update_partial("教育价值它是教育应该干什么呢啊")
+    _release_all(win)
+    win.update_partial("完全不同的另一句话放在这里")      # a rewrite
+    assert not win._live_corrections(), "a large rewrite was marked"
 
     # A corrected unit materialises from a partly visible value, not from nothing.
     # Starting from nothing is the cue that means "this is new", and confusing the
