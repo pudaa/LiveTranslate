@@ -6,6 +6,8 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
+from livetranslate.asr.funasr_boot import import_auto_model
+
 log = logging.getLogger("LiveTranslate.SenseVoice")
 
 SAMPLE_RATE = 16000
@@ -26,7 +28,10 @@ class SenseVoiceEngine:
     """Speech-to-text using FunASR SenseVoice."""
 
     def __init__(self, model_name=None, device="cuda", hub="ms", pad_seconds=None):
-        from funasr import AutoModel
+        # Through funasr_boot, not `from funasr import AutoModel`: funasr's
+        # __init__ imports all 432 of its submodules, dragging in nine other
+        # model families plus sklearn/scipy for ~22s that SenseVoice never uses.
+        AutoModel = import_auto_model()
         from livetranslate.models.manager import (
             get_local_model_path,
             asr_model_id,

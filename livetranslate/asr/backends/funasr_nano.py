@@ -23,7 +23,11 @@ class FunASRNanoEngine:
         # Pre-register FunASRNano model class before AutoModel looks it up
         import model as _nano_model  # noqa: F401
 
-        from funasr import AutoModel
+        from livetranslate.asr.funasr_boot import import_auto_model
+
+        # FunASRNano's own model code imports transformers, so only the
+        # clustering deps get blocked on this path.
+        AutoModel = import_auto_model(allow_transformers=True)
         from livetranslate.models.manager import (
             ASR_MODEL_IDS,
             ensure_qwen_weights,
