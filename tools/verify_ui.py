@@ -14,6 +14,7 @@ Nothing is shown on screen; exit code 0 = all checks passed.
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import time
@@ -287,13 +288,27 @@ def _subtitle_lines():
     _APP.processEvents()
     win.grab().save(str(LOGS_DIR / "subtitle-two-lines.png"))
 
-    # Pacing: an update arriving immediately after the previous one is *delayed*
-    # rather than applied, which is what makes live captions lag the audio.
+    # Pacing: a minimum display time is implemented by *deferring* the next
+    # replacement. That is right for wrapped lines and wrong for a marquee, where
+    # the text is already on screen as the in-progress line -- deferring only
+    # makes the committed line arrive late.
+    assert win._scroll_line_config() is not None
     win._last_insert_time = time.monotonic() * 1000
     win.update_text("紧接着的一句", {})
-    assert win._pending_segment_timers, "update was not paced"
-    for timer in win._pending_segment_timers:
+    assert not win._pending_segment_timers, "marquee mode deferred the commit"
+
+    wrapped_cfg = copy.deepcopy(DEFAULT_SUBTITLE_WIN_SETTINGS)
+    for line_cfg in wrapped_cfg["lines"]:
+        line_cfg["scroll"] = False
+    wrapped = SubtitleWindow(wrapped_cfg)
+    wrapped.show()
+    _APP.processEvents()
+    wrapped._last_insert_time = time.monotonic() * 1000
+    wrapped.update_text("紧接着的一句", {})
+    assert wrapped._pending_segment_timers, "wrapped mode lost its pacing"
+    for timer in wrapped._pending_segment_timers:
         timer.stop()
+    wrapped.close()
 
     win.close()
     return (
@@ -424,6 +439,59 @@ def _subtitle_marquee_animation():
     return f"gap froze at {frozen:.0f}px, {parked:.0f}px of new text slides in"
 
 
+def _subtitle_no_blank_frames():
+    """The caption must never go blank mid-utterance, and a commit must not lurch.
+
+    main.py cleared the in-progress line *before* committing, leaving a frame with
+    neither a partial nor committed text. Since the commit can be deferred by
+    min_display_ms, the caption stayed blank for up to 1.5s and then slid back in
+    from the right -- which is exactly what made the animation unusable. The
+    repeated 0 <-> N width jumps also fired the insertion compensation on every
+    sentence, lurching the line sideways.
+    """
+    from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS, SubtitleWindow
+
+    settings = dict(DEFAULT_SUBTITLE_WIN_SETTINGS)
+    settings["min_display_ms"] = 1500  # the value that made the blank last
+    win = SubtitleWindow(settings)
+    win.show()
+    _APP.processEvents()
+    tw = win._text_widgets[0]
+
+    started = False
+    blanks = []
+    for sentence in (
+        "那么第三个标准的划分叫做根据教育功能",
+        "分成显性和隐性两种类型",
+        "第一种是显性课程",
+    ):
+        for event in ("partial-short", "partial-full", "commit"):
+            if event == "commit":
+                win.update_text(sentence, {})
+            else:
+                win.update_partial(sentence[:8] if event == "partial-short" else sentence)
+            _APP.processEvents()
+            rendered = len(tw._text)
+            if rendered:
+                started = True
+            elif started:
+                blanks.append(f"{event}:{sentence[:6]}")
+    assert not blanks, f"the caption went blank mid-utterance: {blanks}"
+
+    # Committing the sentence already on screen as the in-progress line must not
+    # change the line's width, or the insertion animation fires and the caption
+    # jumps sideways for no reason the viewer can see.
+    win.update_partial("一句话正在显示")
+    _APP.processEvents()
+    win._slide_px = 0.0
+    win.update_text("一句话正在显示", {})
+    _APP.processEvents()
+    assert win._slide_px == 0.0, f"committing added a {win._slide_px:.0f}px lurch"
+
+    win.close()
+    return "no blank frame across 9 partial/commit events; commit adds no lurch"
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -438,6 +506,7 @@ def main() -> int:
     check("9. subtitle in-progress line grows then commits once", _subtitle_partial_line)
     check("10. subtitle marquee: one row, trims from the front", _subtitle_marquee)
     check("11. marquee gap freezes; new text slides in", _subtitle_marquee_animation)
+    check("12. no blank frame; commit adds no lurch", _subtitle_no_blank_frames)
 
     print("PASSED:")
     for p in PASS:

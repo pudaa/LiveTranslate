@@ -477,6 +477,13 @@ class _SubtitleTextWidget(QWidget):
         """
         self._marquee = [[str(t), float(g or 0.0)] for t, g in items]
         self._marquee_slide_px = float(slide_px or 0.0)
+        # Reset the entry/exit animation state the way set_text() does. A value
+        # left over from an unrelated animate_out() would otherwise keep the line
+        # faded or offset, since this path does not go through set_text().
+        self._stop_all_animations()
+        self._content_opacity_val = 1.0
+        self._slide_offset_x_val = 0.0
+        self._slide_offset_y_val = 0.0
         self._text = "".join(t for t, _ in self._marquee)
         self._wrapped_lines = [self._text] if self._text else []
         self._pending_text = None
@@ -1119,7 +1126,15 @@ class SubtitleWindow(QWidget):
         # Respect minimum display time: delay if previous sentence was inserted recently
         now_ms = time.monotonic() * 1000
         elapsed = now_ms - self._last_insert_time
-        base_delay = max(0, int(self._min_display_ms - elapsed)) if self._last_insert_time > 0 else 0
+        if self._scroll_line_config() is not None:
+            # A marquee has no such thing as a minimum display time: the text is
+            # already on screen as the in-progress line, so deferring the
+            # replacement only makes the committed line show up late.
+            base_delay = 0
+        elif self._last_insert_time > 0:
+            base_delay = max(0, int(self._min_display_ms - elapsed))
+        else:
+            base_delay = 0
 
         if base_delay == 0:
             self._insert_sentence(original, translations)

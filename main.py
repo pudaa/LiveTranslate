@@ -1582,11 +1582,6 @@ class LiveTranslateApp:
         if self._subwin and self._subwin.isVisible():
             self._subwin.update_partial(text)
 
-    def _clear_partial(self) -> None:
-        """Drop the in-progress line; committed text supersedes it."""
-        if self._subwin:
-            self._subwin.update_partial("")
-
     def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0, t_end=None):
         """Output a text result (from interim or final) — similar to _process_segment but skips ASR."""
         original_text = text.strip()
@@ -1616,7 +1611,12 @@ class LiveTranslateApp:
                 self._overlay.add_message(
                     msg_id, timestamp, original_text, source_lang, asr_ms
                 )
-        self._clear_partial()
+        # No _clear_partial() here on purpose. The in-progress line is only
+        # cleared *inside* the subtitle window, when the committed sentence
+        # actually replaces it. Clearing it up front left a frame with no
+        # partial and no committed text, so the caption went blank -- and since
+        # the commit can be deferred, blank for as long as that delay -- then
+        # slid back in from the right.
         self._transcript.write_original(msg_id, timestamp, original_text)
         self._srt_emit(original_text, t_end=t_end)
 
