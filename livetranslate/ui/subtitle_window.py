@@ -873,6 +873,10 @@ class SubtitleWindow(QWidget):
         # timer, plus the last measured text width so a growth can be detected.
         self._slide_px = 0.0
         self._last_text_width = 0.0
+        # Width removed by trimming, cancelled out of the insertion compensation:
+        # trimming drops only characters already faded past the left edge, so it
+        # changes nothing visible and compensating it invents a sideways jump.
+        self._trimmed_px = 0.0
         self._last_tick = 0.0
         # Paced release. The recogniser hands over a whole phrase at once, which
         # lands as one lump the reader has to re-scan to find the new part, and
@@ -1325,6 +1329,12 @@ class SubtitleWindow(QWidget):
         self._display_tail = ""
         self._release_queue = ""
         self._release_credit = 0.0
+        # Re-baseline the insertion compensation. The tail has just moved into the
+        # sentence list, which is the same text in a different container -- not a
+        # change the reader should see. Without this the transition measured as a
+        # jump and parked the line, giving a lurch on every commit.
+        self._last_text_width = 0.0
+        self._trimmed_px = 0.0
         # The committed text now covers whatever the partial line was showing.
         self._partial = ""
         self._start_marquee()
@@ -1570,14 +1580,22 @@ class SubtitleWindow(QWidget):
         itself back in -- which is not the cue we want. A single unit simply
         appears where it belongs and fades in, which is what marks it as new.
 
+        Trimming is excluded (see _trim_marquee). Trimmed characters have already
+        faded out past the left edge, so removing them changes nothing visible --
+        compensating that shrink invents a sideways jump for no reason. Measured
+        before this was excluded: 562 compensations in a short session, every one
+        of them negative, every one of them caused by a trim, reaching -482px.
+
         Only *text* growth is considered at all: the pause gap is meant to push
         the line along, since that is what shows time passing.
         """
         width = self._marquee_text_width()
         if self._last_text_width:
-            growth = width - self._last_text_width
+            # Undo the part of the change that trimming caused: it is invisible.
+            growth = width - self._last_text_width + self._trimmed_px
             if abs(growth) > self._typical_unit_px() * 1.6:
                 self._slide_px += growth
+        self._trimmed_px = 0.0
         self._last_text_width = width
 
     def _marquee_text_width(self) -> float:
@@ -1656,6 +1674,10 @@ class SubtitleWindow(QWidget):
             all_text = "".join(s[0] for s in self._sentences)
             avg = max(1.0, total / max(1, len(all_text)))
             drop = max(1, min(len(head), int(excess / avg) or 1))
+            # Record what this removed so the insertion compensation can ignore it:
+            # these characters are already faded out past the left edge, so their
+            # removal changes nothing visible.
+            self._trimmed_px += fm.horizontalAdvance(head[:drop])
             self._sentences[0][0] = head[drop:]
 
     def _refresh_display(self):
@@ -1743,6 +1765,10 @@ class SubtitleWindow(QWidget):
         self._last_text_at = 0.0
         self._slide_px = 0.0
         self._last_text_width = 0.0
+        # Width removed by trimming, cancelled out of the insertion compensation:
+        # trimming drops only characters already faded past the left edge, so it
+        # changes nothing visible and compensating it invents a sideways jump.
+        self._trimmed_px = 0.0
         self._marquee_timer.stop()
         self._cancel_pending_segments()
         self._auto_hide_timer.stop()

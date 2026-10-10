@@ -643,6 +643,27 @@ def _subtitle_anchor_and_revision():
         f"the insertion offset accumulated across corrections: {offsets}"
     )
 
+    # Trimming must not drive the insertion compensation. Trimmed characters have
+    # already faded out past the left edge, so removing them changes nothing
+    # visible; compensating it invents a sideways jump. Measured before the two
+    # were separated: 562 compensations in one short session, every one negative,
+    # every one caused by a trim, reaching -482px.
+    win.clear()
+    win._slide_px = 0.0
+    for index in range(10):
+        win.update_partial("所以我们去提到教育的功能它有好有坏这个要明确")
+        _release_all(win)
+        for _ in range(20):
+            win._last_tick = time.monotonic() - 0.016
+            win._tick_marquee()
+        win.update_text("所以我们去提到教育的功能它有好有坏这个要明确", {})
+        win._fit_height_snap()
+        win._last_tick = time.monotonic() - 0.016
+        win._tick_marquee()
+        assert abs(win._slide_px) < 2.0, (
+            f"trimming drove the caption sideways: {win._slide_px:.0f}px"
+        )
+
     # The replacement must still be paced, not swapped in wholesale.
     win.clear()
     win.update_partial("教育价值它是教育应该干什么呢啊")
