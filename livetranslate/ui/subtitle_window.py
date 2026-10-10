@@ -1571,6 +1571,30 @@ class SubtitleWindow(QWidget):
             return 0.0
         return float(QFontMetrics(tw._font).horizontalAdvance("中") or 16)
 
+    # ------------------------------------------------------------------
+    # HIGH RISK. Read before changing anything here.
+    #
+    # This method exists to smooth the sideways motion caused by text arriving,
+    # by parking the line and easing it back. Its judgement is "the content width
+    # changed", and that is not a sound basis for deciding whether the *reader*
+    # needs to see a movement. It has caused three regressions:
+    #
+    #   1. it fired for every released unit, so the caption appeared to keep
+    #      sliding itself in from the right, several times a second
+    #   2. once it also compensated shrinkage, it wrote negative offsets -- and
+    #      the decay was guarded on `> 0.0`, so negative ones never decayed at
+    #      all: six corrections accumulated -540px and pushed the line off screen
+    #   3. trimming shrinks the width too, and trimmed characters have already
+    #      faded past the left edge -- so it invented a jump for something
+    #      invisible: 562 compensations in one short session, all negative,
+    #      reaching -482px
+    #
+    # Every fix has been a patch on a wrong criterion: the width change cannot
+    # distinguish "the visible content changed" from "invisible content changed".
+    # If it misbehaves a fourth time, remove it rather than patch it again. The
+    # sound alternative is to stop deriving the line's position from the content
+    # width at all -- see the belt idea in the project notes.
+    # ------------------------------------------------------------------
     def _compensate_insertion(self) -> None:
         """Park a large jump of new text off to the right for the animation to carry in.
 
