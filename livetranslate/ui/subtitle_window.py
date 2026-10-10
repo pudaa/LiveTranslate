@@ -95,6 +95,11 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # what keeps it distinguishable from genuinely new text.
     "correction_fade_in_ms": 320,
     "correction_fade_from": 0.45,
+    # Largest mid-line hole tolerated while holding a corrected span's width, in
+    # reading units. Small corrections -- the common case, one or two characters --
+    # hold exactly; a large one would need a hole as wide as the text removed,
+    # which is worse than the shift it avoids.
+    "correction_pad_max_units": 2.2,
     # Minimum time a sentence stays up before it may be replaced, in ms.
     # Applied by delaying the replacement, so a large value makes live captions
     # lag the audio; 0 disables the throttle.
@@ -892,6 +897,14 @@ class SubtitleWindow(QWidget):
         # when applied]. Counted from the end because text is only ever appended
         # there or trimmed from the front, so the offset stays valid.
         self._corrections: list[list] = []
+        # Correction in flight. The replaced span is removed at once, but its width
+        # is held by padding that is consumed as the replacement types in, so the
+        # line neither moves nor changes width while that happens.
+        self._corr_active = False
+        self._corr_prefix = ""
+        self._corr_old = ""
+        self._corr_new = ""
+        self._corr_shown = ""
         self._marquee_timer = QTimer(self)
         self._marquee_timer.setInterval(16)  # ~60fps
         self._marquee_timer.timeout.connect(self._tick_marquee)
@@ -1332,6 +1345,7 @@ class SubtitleWindow(QWidget):
         self._display_tail = ""
         self._release_queue = ""
         self._release_credit = 0.0
+        self._finish_correction()
         # The committed text now covers whatever the partial line was showing.
         self._partial = ""
         self._start_marquee()
@@ -1358,28 +1372,101 @@ class SubtitleWindow(QWidget):
                 return cfg
         return None
 
-    def _pad_replacement(self, old_text: str, new_text: str) -> str:
-        """Pad ``new_text`` so it occupies the same width as ``old_text``.
+    def _pad_replacement(self, old_text: str, new_text: str, shown_text: str,
+                         limit_px: float = None) -> str:
+        """Padding that holds a corrected span's width while it fills in.
 
-        A correction must not change the line's total width: because the line is
-        right-anchored, even a one-character difference shifts everything to the
-        left of it, and the reader loses the place they had.
+        A correction must not change the line's total width: the line is
+        right-anchored, so any difference shifts everything to the left of it.
 
-        The padding is exact for CJK, which is the common case: a CJK font's
-        advances are one em each and U+3000 is exactly that width. Anything else
-        (Latin, digits) is approximated and the residue is left to the slide
-        animation, which is why the residue is returned too.
+        The width to hold is ``pad + shown``, which stays constant if the padding
+        covers both the part of the replacement not yet typed *and* the residual
+        left over once it is complete::
+
+            pad = (width(new) - width(shown)) + final_residual
+
+        Starting from the whole replacement width and shrinking as it types in is
+        what keeps the line still for the whole operation, not just at the end.
+
+        The residual is capped by ``limit_px``: holding it exactly through a large
+        replacement would need a hole as wide as the text removed, and a big hole
+        mid-line is worse than the shift it avoids. The uncapped remainder is left
+        to the slide animation instead.
+
+        Padding goes before the replacement, not after. Trailing padding sits at
+        the line's right edge, where it reads as the caption failing to keep up; a
+        gap inside the line reads as a pause, which is what a gap already means.
         """
         tw = self._text_widgets[0] if self._text_widgets else None
         if tw is None or not old_text:
-            return new_text
+            return ""
         fm = QFontMetrics(tw._font)
-        deficit = fm.horizontalAdvance(old_text) - fm.horizontalAdvance(new_text)
-        if deficit <= 0:
-            return new_text
+        new_w = fm.horizontalAdvance(new_text or "")
+        lost = fm.horizontalAdvance(old_text) - new_w
+        residual = max(0.0, lost)
+        if limit_px is not None:
+            residual = min(residual, limit_px)
+        remaining = max(0.0, new_w - fm.horizontalAdvance(shown_text or ""))
+        total = residual + remaining
+        if total <= 0:
+            return ""
         pad_char = "\u3000" if fm.horizontalAdvance("\u3000") > 0 else " "
         pad_w = fm.horizontalAdvance(pad_char) or 1
-        return new_text + pad_char * int(deficit // pad_w)
+        return pad_char * int(total // pad_w)
+
+    def _pad_limit_px(self) -> float:
+        """Largest hole tolerated mid-line, in px."""
+        tw = self._text_widgets[0] if self._text_widgets else None
+        if tw is None:
+            return 0.0
+        fm = QFontMetrics(tw._font)
+        units = float(self._settings.get("correction_pad_max_units", 2.2))
+        return fm.horizontalAdvance("\u3000") * max(0.0, units)
+
+    def _rebuild_display_tail(self) -> None:
+        """Recompose the rendered tail while a correction is filling in."""
+        if not self._corr_active:
+            return
+        self._display_tail = self._corr_prefix + self._pad_replacement(
+            self._corr_old, self._corr_new, self._corr_shown, self._pad_limit_px()
+        ) + self._corr_shown
+
+    def _start_correction(self, prefix: str, old_suffix: str, new_suffix: str) -> None:
+        """Replace a span by typing the replacement in behind reserved space.
+
+        The replaced text is removed at once -- leaving known-wrong words up while
+        the replacement types in would be worse -- but its width is held by
+        padding that is consumed as the replacement arrives. The result is that the
+        line neither moves nor changes width during the whole operation.
+        """
+        self._corr_active = True
+        self._corr_prefix = prefix
+        self._corr_old = old_suffix
+        self._corr_new = new_suffix
+        self._corr_shown = ""
+        self._release_queue = new_suffix
+        self._release_credit = 0.0
+        self._released_tail = prefix
+        self._rebuild_display_tail()
+
+        # Whatever the cap did not hold shows up as movement. Hand it to the slide
+        # so it eases over the settle constant rather than jumping.
+        tw = self._text_widgets[0] if self._text_widgets else None
+        if tw is not None and old_suffix:
+            fm = QFontMetrics(tw._font)
+            held = fm.horizontalAdvance(self._pad_replacement(
+                old_suffix, new_suffix, "", self._pad_limit_px()
+            )) + fm.horizontalAdvance(new_suffix or "")
+            lost = fm.horizontalAdvance(old_suffix) - held
+            if lost > 0:
+                self._slide_px -= lost
+
+    def _finish_correction(self) -> None:
+        self._corr_active = False
+        self._corr_prefix = ""
+        self._corr_old = ""
+        self._corr_new = ""
+        self._corr_shown = ""
 
     def _mark_correction(self, units_from_end: int, count: int) -> None:
         """Record a corrected span so it can be underlined for a while."""
@@ -1422,22 +1509,12 @@ class SubtitleWindow(QWidget):
 
         changed_old = self._released_tail[keep:]
         changed_new = text[keep:]
-        padded = self._pad_replacement(changed_old, changed_new)
-        self._display_tail = self._display_tail[:keep] + padded
-        self._released_tail = text
-        self._release_queue = ""
-        self._release_credit = 0.0
+        # Route the replacement through the same buffered, one-unit-at-a-time
+        # release that new text gets. Replacing the span outright made it appear as
+        # one lump -- exactly the problem the release queue exists to solve.
+        self._start_correction(text[:keep], changed_old, changed_new)
 
-        # Residual growth the padding could not absorb: hand it to the slide so the
-        # line eases into its new position instead of jumping.
-        tw = self._text_widgets[0] if self._text_widgets else None
-        if tw is not None:
-            fm = QFontMetrics(tw._font)
-            residual = fm.horizontalAdvance(changed_new) - fm.horizontalAdvance(changed_old)
-            if residual > 0:
-                self._slide_px += residual
-
-        from_end = len(split_marquee_units(padded)) if changed_new else 0
+        from_end = len(split_marquee_units(changed_new))
         self._mark_correction(from_end, len(split_marquee_units(changed_new)))
 
     def _release_step(self, dt: float) -> bool:
@@ -1463,10 +1540,19 @@ class SubtitleWindow(QWidget):
         while self._release_credit >= 1.0 and self._release_queue:
             head = split_marquee_units(self._release_queue)[0]
             self._released_tail += head
-            self._display_tail += head
+            if self._corr_active:
+                # While a correction fills in, the release feeds the replacement so
+                # the padding can shrink by exactly what has arrived.
+                self._corr_shown += head
+                self._rebuild_display_tail()
+            else:
+                self._display_tail += head
             self._release_queue = self._release_queue[len(head):]
             self._release_credit -= 1.0
             released += 1
+        if released and self._corr_active and not self._release_queue:
+            self._finish_correction()
+            self._rebuild_display_tail()
         if released:
             self._fresh_count = released
             self._fresh_at = time.monotonic()
@@ -1480,7 +1566,12 @@ class SubtitleWindow(QWidget):
         if not self._release_queue:
             return
         self._released_tail += self._release_queue
-        self._display_tail += self._release_queue
+        if self._corr_active:
+            self._corr_shown += self._release_queue
+            self._finish_correction()
+            self._rebuild_display_tail()
+        else:
+            self._display_tail += self._release_queue
         self._fresh_count = len(split_marquee_units(self._release_queue))
         self._fresh_at = time.monotonic()
         self._release_queue = ""
@@ -1765,6 +1856,7 @@ class SubtitleWindow(QWidget):
         self._fresh_count = 0
         self._fresh_at = 0.0
         self._corrections.clear()
+        self._finish_correction()
         self._live_gap_px = 0.0
         self._frozen_gap = None
         self._last_text_at = 0.0

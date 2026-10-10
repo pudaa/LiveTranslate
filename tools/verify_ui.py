@@ -606,11 +606,9 @@ def _subtitle_anchor_and_revision():
     _release_all(win)
     assert win._slide_px == 0.0, f"a one-unit release was parked ({win._slide_px:.0f}px)"
 
-    # A correction must not change the line's width. It is right-anchored, so any
-    # difference shifts everything to the left of the change -- the reader loses
-    # the place they had. A shorter correction is padded out with U+3000, which is
-    # exactly one CJK advance; a longer one cannot be padded and is handed to the
-    # slide residual instead.
+    # The width must hold for the *whole* correction, not just at its end. The
+    # replacement types in behind reserved space that is consumed as it arrives,
+    # so the line does not move at any point in the operation.
     from PyQt6.QtGui import QFontMetrics
 
     tw = win._text_widgets[0]
@@ -618,15 +616,26 @@ def _subtitle_anchor_and_revision():
         "".join(t for t, _ in tw._marquee)
     )
     win.clear()
-    win.update_partial("教育价值它是教育应该干什么呢啊")
+    win.update_partial("教育价值它是教育应该干什么啊")
     _release_all(win)
     before = line_width()
-    win.update_partial("教育价值他是教育应该干什么")  # three characters shorter
-    _APP.processEvents()
-    after = line_width()
-    assert abs(after - before) < 0.5, (
-        f"a shorter correction moved the line by {after - before:+.0f}px"
-    )
+    win.update_partial("教育价值他是教育应该干什么")  # one character shorter
+    widths = [line_width()]
+    for _ in range(120):
+        if win._release_step(0.016):
+            win._render_marquee()
+        widths.append(line_width())
+        if not win._release_queue:
+            break
+    distinct = sorted({round(w) for w in widths})
+    assert len(distinct) == 1, f"the width varied during the correction: {distinct}"
+    assert abs(widths[-1] - before) < 0.5, f"ended {widths[-1] - before:+.0f}px off"
+
+    # The padding must sit inside the line, not trail at the right edge where it
+    # reads as the caption failing to keep up.
+    tail = "".join(t for t, _ in tw._marquee)
+    assert not tail.endswith("\u3000"), "padding is trailing at the right edge"
+    assert "\u3000" in tail, "a shorter correction left no padding at all"
 
     # A corrected unit materialises from a partly visible value, not from nothing.
     # Starting from nothing is the cue that means "this is new", and confusing the
