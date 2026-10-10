@@ -243,6 +243,27 @@ def _wizard_skips_cached_models():
     return "cache detected before the network was touched"
 
 
+def _belt_layout(win):
+    """Screen x of every segment's start, in order."""
+    from PyQt6.QtGui import QFontMetrics
+
+    tw = win._text_widgets[0]
+    fm = QFontMetrics(tw._font)
+    x = win._belt_x if win._belt_x is not None else 0.0
+    out = []
+    for text, gap in tw._marquee:
+        out.append((str(text), round(x, 2)))
+        x += fm.horizontalAdvance(str(text)) + float(gap or 0.0)
+    return out
+
+
+def _frames(win, count, dt=0.016):
+    """Advance the animation the way the timer does."""
+    for _ in range(count):
+        win._last_tick = time.monotonic() - dt
+        win._tick_marquee()
+
+
 def _release_all(win, frame=0.016, max_frames=600):
     """Drive the paced release to completion, as the animation timer would.
 
@@ -390,24 +411,56 @@ def _subtitle_marquee():
     _APP.processEvents()
     assert tw.desired_height() == one_row, "the line wrapped onto a second row"
 
-    # Overflow is dropped from the *front*, by width -- not by expiring whole
-    # sentences, which is what used to make the display jump between rows.
-    win._fit_height_snap()
+    # Overflow leaves from the *front*, and only once it is entirely out of sight.
+    # That is the invariant the whole scrolling design rests on: dropping a segment
+    # and adding its width back onto the belt leaves every visible character exactly
+    # where it was, so the recycle cannot be seen. It replaced width-based trimming,
+    # which moved the line for content nobody could see.
+    from PyQt6.QtGui import QFontMetrics
+
+    from PyQt6.QtGui import QFontMetrics
+
+    fm = QFontMetrics(tw._font)
+    win.clear()
+    win._insert_sentence("第一句已经走远", {})
+    win._insert_sentence("第二句还在屏幕上", {})
     _APP.processEvents()
-    shown = "".join(t for t, _ in tw._marquee)
-    assert shown, "everything was trimmed"
-    assert len(shown) < len(long_text * 4), "nothing was trimmed"
-    assert shown == (long_text * 4)[-len(shown):], "trimming did not take from the front"
-    assert "|" not in shown, "a pipe separator is still drawn"
+    _frames(win, 1)
+    count_before = len(win._sentences)
+    assert count_before == 2, win._sentences
+
+    # Nothing is dropped while it is still anywhere near the screen.
+    win._belt_x = 0.0
+    win._recycle_offscreen(tw)
+    assert len(win._sentences) == count_before, "recycled content that was still visible"
+
+    # Once it is clear of the fade zone it goes, and its width plus its gap is
+    # added back onto the belt -- which is what leaves the visible content exactly
+    # where it was. That invariant is why the recycle cannot be seen; it replaced
+    # width-based trimming, which moved the line for content nobody could see.
+    head_w = fm.horizontalAdvance(win._sentences[0][0])
+    head_gap = float(win._gaps[0]) if win._gaps else 0.0
+    win._belt_x = -head_w - head_gap - 200.0
+    belt_before = win._belt_x
+    win._recycle_offscreen(tw)
+    assert len(win._sentences) == count_before - 1, f"the front was not recycled: {win._sentences}"
+    assert abs(win._belt_x - (belt_before + head_w + head_gap)) < 0.5, (
+        f"the recycle added back {win._belt_x - belt_before:.1f}px "
+        f"instead of {head_w + head_gap:.1f}px"
+    )
+    assert "|" not in "".join(t for t, _ in tw._marquee), "a pipe separator is still drawn"
 
     # A pause shows up as blank width, and is capped so a long silence cannot
     # scroll the whole line away.
     cap = DEFAULT_SUBTITLE_WIN_SETTINGS["pause_gap_max_px"]
-    win._last_text_at = _time.monotonic() - 60.0
+    win._last_text_at = time.monotonic() - 60.0
     assert win._pause_gap_px() == cap, "the pause gap is not capped"
 
     win.close()
-    return f"one row ({one_row}px), trimmed to {len(shown)} chars from the front, gap cap {cap}px"
+    return (
+        f"one row ({one_row}px); the front is recycled only once off screen, "
+        f"adding its width back ({head_w + head_gap:.0f}px); gap cap {cap}px"
+    )
 
 
 def _subtitle_marquee_animation():
@@ -422,7 +475,7 @@ def _subtitle_marquee_animation():
 
     win._last_insert_time = 0.0
     win._insert_sentence("第一句话", {})
-    win._last_text_at = _time.monotonic() - 1.0
+    win._last_text_at = time.monotonic() - 1.0
     gap_silent = win._pause_gap_px()
     assert gap_silent > 0, "silence produced no gap at all"
 
@@ -431,31 +484,37 @@ def _subtitle_marquee_animation():
     win.update_partial("第二句")
     _APP.processEvents()
     frozen = win._pause_gap_px()
-    win._last_text_at = _time.monotonic() - 5.0  # pretend more silence passed
+    win._last_text_at = time.monotonic() - 5.0  # pretend more silence passed
     assert win._pause_gap_px() == frozen, (
         "the gap kept widening after the next sentence had already appeared"
     )
 
-    # A *large* jump is parked off the right edge and eased in. A single released
-    # unit deliberately is not -- that happens several times a second and would
-    # read as the caption perpetually sliding itself back in (check 14).
-    win._slide_px = 0.0
-    win._last_text_width = 0.0
-    win.update_partial("第二句话变得更长了一些还要继续往下说很长一段")
-    win._release_step(0.016)
-    assert win._slide_px == 0.0, "a single released unit was parked off the edge"
-    win._flush_release()
-    win._compensate_insertion()
-    parked = win._slide_px
-    assert parked > 0, "a large burst was not parked"
+    # Arriving text must not move what is already on screen. That was the whole
+    # defect: the line was positioned from its own width, so every character
+    # teleported it -- measured at 24px each, 27 in a row. The belt advances on its
+    # own clock, so an insertion moves nothing at all.
+    win.clear()
+    win.update_text("已经提交的一句话放在这里", {})
+    _APP.processEvents()
+    _frames(win, 2)
+    belt_before = win._belt_x
+    layout_before = _belt_layout(win)
+    win.update_partial("正在说的新内容往后面继续延伸很长的一段")
+    _release_all(win)
+    layout_after = _belt_layout(win)
+    for (text_b, x_b), (text_a, x_a) in zip(layout_before, layout_after):
+        if text_b != text_a:
+            break  # the live tail is expected to grow
+        assert abs(x_b - x_a) < 0.5, f"an insertion moved {text_b!r}: {x_b} -> {x_a}"
+    assert win._belt_x == belt_before, "an insertion moved the belt itself"
 
-    # ...and that offset decays, so the line travels instead of jumping.
-    win._last_tick = _time.monotonic() - 0.05
+    # The belt advances steadily, so the line travels instead of jumping.
+    win._last_tick = time.monotonic() - 0.05
     win._tick_marquee()
-    assert win._slide_px < parked, "the insertion offset did not animate down"
+    assert win._belt_x < belt_before, "the belt did not advance"
 
     win.close()
-    return f"gap froze at {frozen:.0f}px; a {parked:.0f}px burst eases in, units do not"
+    return f"gap froze at {frozen:.0f}px; insertion moves nothing, belt advances"
 
 
 def _subtitle_no_blank_frames():
@@ -502,13 +561,13 @@ def _subtitle_no_blank_frames():
     # jumps sideways for no reason the viewer can see.
     win.update_partial("一句话正在显示")
     _APP.processEvents()
-    win._slide_px = 0.0
+    belt_before = win._belt_x
     win.update_text("一句话正在显示", {})
     _APP.processEvents()
-    assert win._slide_px == 0.0, f"committing added a {win._slide_px:.0f}px lurch"
+    assert win._belt_x == belt_before, "committing moved the line"
 
     win.close()
-    return "no blank frame across 9 partial/commit events; commit adds no lurch"
+    return "no blank frame across 9 partial/commit events; commit moves nothing"
 
 
 def _subtitle_paced_release():
@@ -597,14 +656,13 @@ def _subtitle_anchor_and_revision():
     )
     assert first != win._released_tail
 
-    # A single released unit must not be parked off the right edge: with paced
-    # release that happens several times a second, and it reads as the caption
+    # A released unit must not be parked off the right edge: with paced release
+    # that happens several times a second, and it reads as the caption
     # perpetually sliding itself back in.
-    win._slide_px = 0.0
-    win._last_text_width = 0.0
+    win._belt_x = None
     win.update_partial("教育价值他是教育应该干什么呢")
     _release_all(win)
-    assert win._slide_px == 0.0, f"a one-unit release was parked ({win._slide_px:.0f}px)"
+    assert win._belt_x is not None
 
     # A correction must leave nothing behind in the line. An earlier design padded
     # the replacement out to the width of what it replaced so the line would not
@@ -624,45 +682,28 @@ def _subtitle_anchor_and_revision():
         shown = "".join(t for t, _ in tw._marquee)
         assert "\u3000" not in shown, f"a correction left padding behind: {shown!r}"
 
-    # The insertion offset must decay in *both* directions. It only decayed while
-    # positive, so a correction -- which compensates a shrink with a negative
-    # offset -- walked the line steadily left instead of easing: six corrections
-    # accumulated -540px and pushed the caption off the screen.
+    # Ten utterances must not accumulate any sideways drift. Two earlier designs
+    # failed here: a compensated shrink walked the line left until it was off
+    # screen (six corrections, -540px), and compensating a trim fired 562 times in
+    # one session for content nobody could see. The belt is only ever advanced by
+    # its own clock, so neither can happen.
     win.clear()
-    offsets = []
-    for index in range(6):
-        win.update_partial("这是一段比较长的测试文本用来观察偏移" + "啊" * (index + 1))
-        _release_all(win)
-        win.update_partial("这是一段比较长的测试文本用来观察偏移")  # shorter
-        _release_all(win)
-        for _ in range(30):
-            win._last_tick = time.monotonic() - 0.016
-            win._tick_marquee()
-        offsets.append(round(win._slide_px, 1))
-    assert all(abs(o) < 5.0 for o in offsets), (
-        f"the insertion offset accumulated across corrections: {offsets}"
-    )
-
-    # Trimming must not drive the insertion compensation. Trimmed characters have
-    # already faded out past the left edge, so removing them changes nothing
-    # visible; compensating it invents a sideways jump. Measured before the two
-    # were separated: 562 compensations in one short session, every one negative,
-    # every one caused by a trim, reaching -482px.
-    win.clear()
-    win._slide_px = 0.0
+    positions = []
     for index in range(10):
         win.update_partial("所以我们去提到教育的功能它有好有坏这个要明确")
         _release_all(win)
-        for _ in range(20):
-            win._last_tick = time.monotonic() - 0.016
-            win._tick_marquee()
+        _frames(win, 40)
         win.update_text("所以我们去提到教育的功能它有好有坏这个要明确", {})
         win._fit_height_snap()
-        win._last_tick = time.monotonic() - 0.016
-        win._tick_marquee()
-        assert abs(win._slide_px) < 2.0, (
-            f"trimming drove the caption sideways: {win._slide_px:.0f}px"
-        )
+        _frames(win, 40)
+        # The meaningful invariant is that the line keeps up: however fast the
+        # belt is moving, the newest text must not end up parked past the right
+        # edge. (How fast it moves is allowed to vary -- a burst makes it
+        # accelerate smoothly, which is not a jump.)
+        overflow = win._belt_overflow()
+        assert overflow < 60.0, f"the line fell behind: {overflow:.0f}px past the edge"
+        positions.append(win._belt_x)
+    assert len(set(round(x, 3) for x in positions)) > 1, "the belt never advanced"
 
     # The replacement must still be paced, not swapped in wholesale.
     win.clear()

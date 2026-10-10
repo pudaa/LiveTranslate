@@ -84,6 +84,10 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # release_drain_s regardless, which is what keeps the caption real-time.
     "release_units_per_s": 8.0,
     "release_drain_s": 0.4,
+    # How quickly the belt catches up when a burst of text briefly outruns its
+    # steady drift. The drift itself is derived from release_units_per_s, so there
+    # is normally nothing to catch up on.
+    "belt_catchup_s": 0.35,
     # How long a newly released unit takes to fade in -- the visual cue for
     # "this is what just appeared".
     "fresh_fade_in_ms": 220,
@@ -243,7 +247,10 @@ class _SubtitleTextWidget(QWidget):
         self._marquee: list[list] = []  # [[text, gap_px_after], ...]
         # Insertion offset: newly arrived text is parked this far to the right and
         # animated back to zero, so it slides in instead of teleporting.
-        self._marquee_slide_px = 0.0
+        # Left edge of the line, in widget coordinates. This is a running value
+        # owned by the window, not something derived from the content width -- see
+        # _advance_belt. Deriving it was what made every insertion move the line.
+        self._marquee_belt_x = 0.0
         # Trailing units that were just released, and when. They fade in, which is
         # the cue for "this is the part that is new" -- without it the reader has
         # to re-scan the whole line to work out where the addition starts.
@@ -502,24 +509,28 @@ class _SubtitleTextWidget(QWidget):
 
         return segments or [text]
 
-    def set_marquee(self, items: list, slide_px: float = 0.0,
+    def set_marquee(self, items: list, belt_x: float = 0.0,
                     fresh_units: int = 0, fresh_at: float = 0.0,
                     corrections: list = None) -> None:
-        """Render a single, non-wrapping, right-anchored line.
+        """Render a single, non-wrapping line that scrolls like a teleprompter.
 
         ``items`` is ``[[text, gap_px_after], ...]``. The gap after a segment is
         blank width standing in for the pause that followed it -- which is how a
         speaker's silence gets represented, rather than by punctuation the reader
         has no reason to understand.
 
+        ``belt_x`` is the left edge of the whole line in widget coordinates, a
+        running value the window advances at a steady speed. The line is *not*
+        positioned from its own width: doing that meant every arriving character
+        moved the entire line instantly -- measured at 24px per character -- and no
+        amount of easing hid it. Here new text enters past the right edge, is
+        clipped, and flows in with the drift.
+
         ``fresh_units`` trailing reading units fade in from ``fresh_at``, marking
         what has just been added.
-
-        The newest text always ends at the right edge, so new words appear in a
-        fixed place and the older words are what moves.
         """
         self._marquee = [[str(t), float(g or 0.0)] for t, g in items]
-        self._marquee_slide_px = float(slide_px or 0.0)
+        self._marquee_belt_x = float(belt_x)
         self._fresh_units = max(0, int(fresh_units))
         self._fresh_at = float(fresh_at or 0.0)
         # Entries are [units_from_end, count, age]; age drives the fade.
@@ -636,7 +647,7 @@ class _SubtitleTextWidget(QWidget):
 
         # Right-anchored: the end of the line is pinned to the right edge, so the
         # newest words land in a fixed place and the older ones travel left.
-        x = float(w - ow - self.marquee_width() + self._marquee_slide_px)
+        x = float(self._marquee_belt_x)
         all_units = [u for text, _ in self._marquee for u in split_marquee_units(str(text))]
         fresh_from = max(0, len(all_units) - self._fresh_units)
         corrected = set()
@@ -871,12 +882,16 @@ class SubtitleWindow(QWidget):
         self._frozen_gap = None
         # Insertion offset for newly arrived text, eased to zero by the animation
         # timer, plus the last measured text width so a growth can be detected.
-        self._slide_px = 0.0
-        self._last_text_width = 0.0
-        # Width removed by trimming, cancelled out of the insertion compensation:
-        # trimming drops only characters already faded past the left edge, so it
-        # changes nothing visible and compensating it invents a sideways jump.
-        self._trimmed_px = 0.0
+        # Left edge of the line in widget coordinates. None means "not placed yet",
+        # which right-anchors it on the first content; after that it only ever
+        # advances, so nothing an insertion does can move the line.
+        self._belt_x = None
+        # Smoothed content growth in px/s, measured rather than assumed: the line
+        # grows from characters arriving *and* from the pause gaps widening, so a
+        # drift tied only to the character rate falls behind on the gaps.
+        self._belt_growth = 0.0
+        self._belt_meter_at = 0.0
+        self._belt_meter_px = 0.0
         self._last_tick = 0.0
         # Paced release. The recogniser hands over a whole phrase at once, which
         # lands as one lump the reader has to re-scan to find the new part, and
@@ -1329,12 +1344,6 @@ class SubtitleWindow(QWidget):
         self._display_tail = ""
         self._release_queue = ""
         self._release_credit = 0.0
-        # Re-baseline the insertion compensation. The tail has just moved into the
-        # sentence list, which is the same text in a different container -- not a
-        # change the reader should see. Without this the transition measured as a
-        # jump and parked the line, giving a lurch on every commit.
-        self._last_text_width = 0.0
-        self._trimmed_px = 0.0
         # The committed text now covers whatever the partial line was showing.
         self._partial = ""
         self._start_marquee()
@@ -1448,9 +1457,7 @@ class SubtitleWindow(QWidget):
         if released:
             self._fresh_count = released
             self._fresh_at = time.monotonic()
-            # A released unit appears where it belongs and fades in; only a real
-            # jump should be parked off the right edge. See _compensate_insertion.
-            self._compensate_insertion()
+            self._start_marquee()
         return bool(released)
 
     def _flush_release(self) -> None:
@@ -1500,19 +1507,7 @@ class SubtitleWindow(QWidget):
         # Release one reading unit at a time from whatever has been buffered.
         moved = self._release_step(dt)
 
-        # Decay in both directions. The guard here used to be `> 0.0`, which was
-        # fine while only growth was compensated -- but a shrink compensates with a
-        # *negative* offset, and a negative one was never decayed at all. Each
-        # correction then walked the line further left, permanently: six of them
-        # accumulated -540px, which is off the screen entirely.
-        if self._slide_px != 0.0:
-            # Exponential settle rather than a fixed speed: the offset is always
-            # about one reading unit wide, and a time constant absorbs each step
-            # smoothly no matter how big it is or how fast they arrive.
-            tau = max(0.02, float(self._settings.get("slide_settle_ms", 90)) / 1000.0)
-            self._slide_px *= math.exp(-dt / tau)
-            if abs(self._slide_px) < 0.5:
-                self._slide_px = 0.0
+        if self._advance_belt(dt):
             moved = True
 
         gap = self._pause_gap_px()
@@ -1552,13 +1547,9 @@ class SubtitleWindow(QWidget):
             tw = self._text_widgets[wi]
             if not (cfg.get("scroll") and tw._scroll_mode):
                 continue
-            if cfg.get("type", "original") == "original":
-                # Every release adds width, and without this the whole line would
-                # jump left by that width on each frame's release.
-                self._compensate_insertion()
             tw.set_marquee(
                 self._marquee_items(cfg.get("type", "original"), cfg),
-                self._slide_px,
+                self._belt_position(tw),
                 self._fresh_count,
                 self._fresh_at,
                 self._live_corrections(),
@@ -1570,57 +1561,6 @@ class SubtitleWindow(QWidget):
         if tw is None:
             return 0.0
         return float(QFontMetrics(tw._font).horizontalAdvance("中") or 16)
-
-    # ------------------------------------------------------------------
-    # HIGH RISK. Read before changing anything here.
-    #
-    # This method exists to smooth the sideways motion caused by text arriving,
-    # by parking the line and easing it back. Its judgement is "the content width
-    # changed", and that is not a sound basis for deciding whether the *reader*
-    # needs to see a movement. It has caused three regressions:
-    #
-    #   1. it fired for every released unit, so the caption appeared to keep
-    #      sliding itself in from the right, several times a second
-    #   2. once it also compensated shrinkage, it wrote negative offsets -- and
-    #      the decay was guarded on `> 0.0`, so negative ones never decayed at
-    #      all: six corrections accumulated -540px and pushed the line off screen
-    #   3. trimming shrinks the width too, and trimmed characters have already
-    #      faded past the left edge -- so it invented a jump for something
-    #      invisible: 562 compensations in one short session, all negative,
-    #      reaching -482px
-    #
-    # Every fix has been a patch on a wrong criterion: the width change cannot
-    # distinguish "the visible content changed" from "invisible content changed".
-    # If it misbehaves a fourth time, remove it rather than patch it again. The
-    # sound alternative is to stop deriving the line's position from the content
-    # width at all -- see the belt idea in the project notes.
-    # ------------------------------------------------------------------
-    def _compensate_insertion(self) -> None:
-        """Park a large jump of new text off to the right for the animation to carry in.
-
-        A jump is only compensated when it is markedly bigger than one reading
-        unit. With paced release a unit lands several times a second, and parking
-        each one off the right edge reads as the caption perpetually sliding
-        itself back in -- which is not the cue we want. A single unit simply
-        appears where it belongs and fades in, which is what marks it as new.
-
-        Trimming is excluded (see _trim_marquee). Trimmed characters have already
-        faded out past the left edge, so removing them changes nothing visible --
-        compensating that shrink invents a sideways jump for no reason. Measured
-        before this was excluded: 562 compensations in a short session, every one
-        of them negative, every one of them caused by a trim, reaching -482px.
-
-        Only *text* growth is considered at all: the pause gap is meant to push
-        the line along, since that is what shows time passing.
-        """
-        width = self._marquee_text_width()
-        if self._last_text_width:
-            # Undo the part of the change that trimming caused: it is invisible.
-            growth = width - self._last_text_width + self._trimmed_px
-            if abs(growth) > self._typical_unit_px() * 1.6:
-                self._slide_px += growth
-        self._trimmed_px = 0.0
-        self._last_text_width = width
 
     def _marquee_text_width(self) -> float:
         """Width of the marquee's text, excluding the pause gaps."""
@@ -1670,39 +1610,132 @@ class SubtitleWindow(QWidget):
                 return value
         return ""
 
-    def _trim_marquee(self, tw) -> None:
-        """Drop what has travelled past the left edge.
+    def _marquee_widget(self):
+        """The widget that draws the scrolling line, or None."""
+        for wi, cfg in enumerate(self._enabled_lines()):
+            if wi >= len(self._text_widgets):
+                break
+            if cfg.get("scroll") and self._text_widgets[wi]._scroll_mode:
+                return self._text_widgets[wi]
+        return None
 
-        Trimming is by rendered width, not by sentence count. Expiring whole
-        sentences is what made the display jump between one and two rows, and it
-        yanks the text the reader is following sideways; trimming a few
-        characters at a time lets the line leave the way it arrived.
+    def _belt_rest_x(self, tw) -> float:
+        """Where the newest character rests: the right edge, inside the outline."""
+        cfg = self._scroll_line_config() or {}
+        ow = max(1, int(cfg.get("outline_width", 1)))
+        return float(tw.width() - 2 * ow)
+
+    def _marquee_content_width(self) -> float:
+        """Width of the whole line, pause gaps included."""
+        tw = self._marquee_widget()
+        if tw is None:
+            return 0.0
+        fm = QFontMetrics(tw._font)
+        cfg = self._scroll_line_config() or {}
+        total = 0.0
+        for text, gap in self._marquee_items("original", cfg):
+            total += fm.horizontalAdvance(str(text)) + float(gap or 0.0)
+        return total
+
+    def _belt_overflow(self) -> float:
+        """How far the newest character sits past its resting place, in px.
+
+        Zero or negative means the line is keeping up; positive means text is
+        arriving faster than the drift, and the belt should catch up.
         """
-        if tw is None or not self._sentences or tw.width() <= 0:
+        tw = self._marquee_widget()
+        if tw is None:
+            return 0.0
+        return (self._belt_position(tw) + self._marquee_content_width()
+                - self._belt_rest_x(tw))
+
+    def _belt_speed(self) -> float:
+        """Leftward drift, matched to how fast the line is actually growing.
+
+        Matching it is what holds the newest character at the right edge: if the
+        belt carries text in at the same rate it arrives, the right end stays put
+        and everything ahead of it is what moves. Nothing moves while nothing is
+        being said, which is right -- a still caption should be still.
+
+        The rate is *measured*, not assumed. Assuming the character rate alone is
+        wrong, because the line also grows as the pause gaps widen, and a drift tied
+        only to characters falls behind -- measured, the newest text ended up 325px
+        past the right edge. The measurement is smoothed so a burst does not lurch
+        the belt, and the catch-up term bounds how far anything can lag.
+        """
+        now = time.monotonic()
+        width = self._marquee_content_width()
+        if not self._belt_meter_at:
+            self._belt_meter_at, self._belt_meter_px = now, width
+        elif (now - self._belt_meter_at) >= 0.1:
+            elapsed = now - self._belt_meter_at
+            rate = (width - self._belt_meter_px) / elapsed
+            self._belt_growth = 0.7 * self._belt_growth + 0.3 * max(0.0, rate)
+            self._belt_meter_at, self._belt_meter_px = now, width
+
+        speed = self._belt_growth
+        overflow = self._belt_overflow()
+        if overflow > 0.0:
+            speed = max(
+                speed,
+                overflow / max(0.15, float(self._settings.get("belt_catchup_s", 0.35))),
+            )
+        return speed
+
+    def _belt_position(self, tw) -> float:
+        """Left edge of the line in widget coordinates.
+
+        Placed right-anchored on the first content, then only ever advanced by the
+        belt. Nothing here reads the content width after that, which is the whole
+        point: while the position was derived from the width, every arriving
+        character moved the entire line instantly -- measured at 24px per
+        character -- and no amount of easing could hide it.
+        """
+        if tw is None:
+            return 0.0
+        if self._belt_x is None:
+            self._belt_x = self._belt_rest_x(tw) - self._marquee_content_width()
+        return self._belt_x
+
+    def _recycle_offscreen(self, tw) -> None:
+        """Drop leading sentences once they are entirely out of sight.
+
+        Dropping a segment and adding its width, plus its gap, back onto the belt
+        leaves every visible character exactly where it was, so the correction is
+        invisible. That invariant is what makes the whole approach work: the only
+        discrete position change happens where nobody can see it.
+        """
+        if tw is None or not self._sentences:
             return
         cfg = self._scroll_line_config() or {}
-        limit = tw.width() + int(cfg.get("fade_out_px", 96))
         fm = QFontMetrics(tw._font)
-        for _ in range(200):  # bounded: each pass drops at least one character
-            total = sum(fm.horizontalAdvance(s[0]) for s in self._sentences)
-            total += sum(self._gaps) + fm.horizontalAdvance(self._display_tail)
-            if total <= limit or not self._sentences:
+        guard = -float(cfg.get("fade_out_px", 96))
+        for _ in range(200):  # bounded: each pass removes at least one segment
+            if not self._sentences:
                 return
             head = self._sentences[0][0]
-            if not head:
-                self._sentences.pop(0)
-                if self._gaps:
-                    self._gaps.pop(0)
-                continue
-            excess = total - limit
-            all_text = "".join(s[0] for s in self._sentences)
-            avg = max(1.0, total / max(1, len(all_text)))
-            drop = max(1, min(len(head), int(excess / avg) or 1))
-            # Record what this removed so the insertion compensation can ignore it:
-            # these characters are already faded out past the left edge, so their
-            # removal changes nothing visible.
-            self._trimmed_px += fm.horizontalAdvance(head[:drop])
-            self._sentences[0][0] = head[drop:]
+            width = fm.horizontalAdvance(head)
+            if self._belt_x + width > guard:
+                return
+            gap = self._gaps.pop(0) if self._gaps else 0.0
+            self._sentences.pop(0)
+            self._belt_x += width + float(gap or 0.0)
+
+    def _advance_belt(self, dt: float) -> bool:
+        """Drift the line left at a steady speed and recycle what has left view."""
+        tw = self._marquee_widget()
+        if tw is None:
+            return False
+        if self._belt_x is None:
+            if not (self._sentences or self._display_tail):
+                return False
+            self._belt_position(tw)
+        if dt <= 0.0:
+            self._recycle_offscreen(tw)
+            return False
+        self._belt_x -= self._belt_speed() * dt
+        self._recycle_offscreen(tw)
+        return True
 
     def _refresh_display(self):
         # The in-progress line counts as content: at the start of an utterance
@@ -1726,11 +1759,13 @@ class SubtitleWindow(QWidget):
             if cfg.get("scroll") and tw._scroll_mode:
                 items = self._marquee_items(line_type, cfg)
                 if line_type == "original":
-                    self._trim_marquee(tw)
+                    # Content only ever moves because the belt moved it; recycle
+                    # whatever has left the viewport without touching the rest.
+                    self._belt_position(tw)
+                    self._recycle_offscreen(tw)
                     items = self._marquee_items(line_type, cfg)
-                    self._compensate_insertion()
                 tw.set_marquee(
-                    items, self._slide_px, self._fresh_count, self._fresh_at,
+                    items, self._belt_position(tw), self._fresh_count, self._fresh_at,
                     self._live_corrections(),
                 )
                 wi += 1
@@ -1787,12 +1822,16 @@ class SubtitleWindow(QWidget):
         self._live_gap_px = 0.0
         self._frozen_gap = None
         self._last_text_at = 0.0
-        self._slide_px = 0.0
-        self._last_text_width = 0.0
-        # Width removed by trimming, cancelled out of the insertion compensation:
-        # trimming drops only characters already faded past the left edge, so it
-        # changes nothing visible and compensating it invents a sideways jump.
-        self._trimmed_px = 0.0
+        # Left edge of the line in widget coordinates. None means "not placed yet",
+        # which right-anchors it on the first content; after that it only ever
+        # advances, so nothing an insertion does can move the line.
+        self._belt_x = None
+        # Smoothed content growth in px/s, measured rather than assumed: the line
+        # grows from characters arriving *and* from the pause gaps widening, so a
+        # drift tied only to the character rate falls behind on the gaps.
+        self._belt_growth = 0.0
+        self._belt_meter_at = 0.0
+        self._belt_meter_px = 0.0
         self._marquee_timer.stop()
         self._cancel_pending_segments()
         self._auto_hide_timer.stop()
