@@ -436,12 +436,18 @@ def _subtitle_marquee_animation():
         "the gap kept widening after the next sentence had already appeared"
     )
 
-    # Arriving text is parked to the right and animated in, not teleported.
-    before = win._slide_px
-    win.update_partial("第二句话变得更长了一些")
-    _release_all(win)
+    # A *large* jump is parked off the right edge and eased in. A single released
+    # unit deliberately is not -- that happens several times a second and would
+    # read as the caption perpetually sliding itself back in (check 14).
+    win._slide_px = 0.0
+    win._last_text_width = 0.0
+    win.update_partial("第二句话变得更长了一些还要继续往下说很长一段")
+    win._release_step(0.016)
+    assert win._slide_px == 0.0, "a single released unit was parked off the edge"
+    win._flush_release()
+    win._compensate_insertion()
     parked = win._slide_px
-    assert parked > before, "new text was not given an insertion offset"
+    assert parked > 0, "a large burst was not parked"
 
     # ...and that offset decays, so the line travels instead of jumping.
     win._last_tick = _time.monotonic() - 0.05
@@ -449,7 +455,7 @@ def _subtitle_marquee_animation():
     assert win._slide_px < parked, "the insertion offset did not animate down"
 
     win.close()
-    return f"gap froze at {frozen:.0f}px, {parked:.0f}px of new text slides in"
+    return f"gap froze at {frozen:.0f}px; a {parked:.0f}px burst eases in, units do not"
 
 
 def _subtitle_no_blank_frames():
@@ -554,6 +560,75 @@ def _subtitle_paced_release():
     )
 
 
+def _subtitle_anchor_and_revision():
+    """The bar must not move when the text grows, and a correction must replace.
+
+    Two behaviours that were both wrong: the window was centred on every height
+    change, so a position the user set never held; and a revised partial was
+    re-queued in full, so words already on screen appeared a second time.
+    """
+    from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS, SubtitleWindow
+
+    win = SubtitleWindow(dict(DEFAULT_SUBTITLE_WIN_SETTINGS))
+    win.show()
+    _APP.processEvents()
+    win.move(200, 300)
+    win._fit_height_snap()
+    _APP.processEvents()
+    bottom = win.y() + win.height()
+
+    win._last_insert_time = 0.0
+    win.update_text("那么第三个标准的划分叫做根据教育功能分成显性和隐性两种", {})
+    win._fit_height_snap()
+    _APP.processEvents()
+    assert win.y() + win.height() == bottom, (
+        f"the bar moved: bottom {bottom} -> {win.y() + win.height()}"
+    )
+
+    # A revised partial replaces the in-progress text instead of re-showing it.
+    win.update_partial("教育价值它是教育应该干什么")
+    _release_all(win)
+    first = win._released_tail
+    win.update_partial("教育价值他是教育应该干什么")  # 它 -> 他
+    _release_all(win)
+    assert win._released_tail == "教育价值他是教育应该干什么", win._released_tail
+    assert win._released_tail.count("教育价值") == 1, (
+        f"the correction re-showed the text already on screen: {win._released_tail}"
+    )
+    assert first != win._released_tail
+
+    # A single released unit must not be parked off the right edge: with paced
+    # release that happens several times a second, and it reads as the caption
+    # perpetually sliding itself back in.
+    win._slide_px = 0.0
+    win._last_text_width = 0.0
+    win.update_partial("教育价值他是教育应该干什么呢")
+    _release_all(win)
+    assert win._slide_px == 0.0, f"a one-unit release was parked ({win._slide_px:.0f}px)"
+
+    win.close()
+    return "bottom edge held; revision replaced in place; one-unit release not parked"
+
+
+def _short_utterance_threshold():
+    """The fragment heuristic must be script-aware."""
+    # main.py lives at the project root, not inside the package.
+    sys.path.insert(0, str(ROOT))
+    from main import LiveTranslateApp as App
+
+    # Six CJK characters is a complete clause, not a fragment -- treating it as
+    # one buffered most of a Chinese lecture and committed it in repeated lumps.
+    assert not App._is_short_utterance("而应该干什么？"), "a CJK clause was treated as a fragment"
+    assert not App._is_short_utterance("是一个应然的结果。")
+    assert App._is_short_utterance("好"), "a filler was not filtered"
+    assert App._is_short_utterance("嗯")
+    # Latin keeps the original threshold.
+    assert App._is_short_utterance("the")
+    assert App._is_short_utterance("and then")
+    assert not App._is_short_utterance("and then we go")
+    return "CJK clauses kept; fillers filtered; Latin unchanged"
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -570,6 +645,8 @@ def main() -> int:
     check("11. marquee gap freezes; new text slides in", _subtitle_marquee_animation)
     check("12. no blank frame; commit adds no lurch", _subtitle_no_blank_frames)
     check("13. ASR text released one unit at a time", _subtitle_paced_release)
+    check("14. bottom-anchored; revision replaces; no park", _subtitle_anchor_and_revision)
+    check("15. fragment heuristic is script-aware", _short_utterance_threshold)
 
     print("PASSED:")
     for p in PASS:

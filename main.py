@@ -1403,8 +1403,17 @@ class LiveTranslateApp:
 
     @staticmethod
     def _is_short_utterance(text: str) -> bool:
-        """Check if text has ≤8 alphanumeric chars (likely noise/filler/fragment)."""
+        """Check if text is a fragment not worth committing on its own.
+
+        The threshold has to be script-aware. Eight alphanumerics is a genuine
+        fragment in Latin script, but in CJK it is a complete clause -- "而应该
+        干什么？" is six -- so treating those as fragments buffers most of a
+        Chinese lecture and then commits it in lumps.
+        """
         alnum = sum(1 for c in text if c.isalnum())
+        cjk = sum(1 for c in text if "\u3400" <= c <= "\u9fff")
+        if cjk > alnum / 2:
+            return alnum <= 3
         return alnum <= 8
 
     def _strip_committed_overlap(self, text: str) -> str:
@@ -1525,8 +1534,17 @@ class LiveTranslateApp:
             if not text:
                 continue
             if self._is_short_utterance(text):
-                self._interim_pending += text
-                log.debug(f"Interim short utterance buffered: '{text}', pending='{self._interim_pending}'")
+                # Do not accumulate the same fragment twice. Successive interim
+                # passes re-recognise overlapping audio (the trim that removes
+                # already-committed audio is only an estimate), so the same short
+                # sentence arrives on every pass; appending blindly produced
+                # sentences containing the same clause five times over.
+                if not self._interim_pending.endswith(text):
+                    self._interim_pending += text
+                    log.debug(
+                        f"Interim short utterance buffered: '{text}', "
+                        f"pending='{self._interim_pending}'"
+                    )
                 continue
 
             if self._interim_pending:

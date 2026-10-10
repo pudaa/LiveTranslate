@@ -948,7 +948,11 @@ class SubtitleWindow(QWidget):
             return
         if self._height_anim and self._height_anim.state() != QPropertyAnimation.State.Stopped:
             self._height_anim.stop()
-        self.move(self.x(), self.y() - (new_h - old_h) // 2)
+        # Anchor the bottom edge, not the centre. A caption bar sits on the video's
+        # lower edge, so growing text should extend upward and leave the baseline
+        # where the user put it. Centring moved the window on every height change,
+        # so a position the user set never held.
+        self.move(self.x(), self.y() + old_h - new_h)
         self.setFixedHeight(new_h)
         self._clamp_to_screen()
         self.position_changed.emit()
@@ -961,7 +965,8 @@ class SubtitleWindow(QWidget):
         if self._height_anim and self._height_anim.state() != QPropertyAnimation.State.Stopped:
             self._height_anim.stop()
 
-        target_y = self.y() - (new_h - old_h) // 2
+        # Bottom-anchored, same as the snap variant: keep y + height constant.
+        target_y = self.y() + old_h - new_h
         self.setMinimumHeight(min(old_h, new_h))
         self.setMaximumHeight(max(old_h, new_h))
 
@@ -1255,12 +1260,19 @@ class SubtitleWindow(QWidget):
         text = text or ""
         if text.startswith(self._released_tail):
             self._release_queue = text[len(self._released_tail):]
-        else:
-            # Either the first text, or the recogniser revised the sentence
-            # rather than extending it -- there is no sensible increment to
-            # spread, so put the whole thing up at once.
-            self._released_tail = ""
-            self._release_queue = text
+            return
+
+        # The recogniser revised what it had rather than extending it (SenseVoice
+        # corrects earlier guesses: 它是 -> 他是). Replace the in-progress text in
+        # place. Re-queueing the whole sentence, as this used to, showed the words
+        # already on screen a second time -- which is what made the caption look
+        # like it kept sliding the same content in again.
+        keep = 0
+        common = min(len(text), len(self._released_tail))
+        while keep < common and text[keep] == self._released_tail[keep]:
+            keep += 1
+        self._released_tail = text[:keep]
+        self._release_queue = text[keep:]
 
     def _release_step(self, dt: float) -> bool:
         """Show at most a little more of the buffered text. True if anything moved.
@@ -1291,6 +1303,9 @@ class SubtitleWindow(QWidget):
         if released:
             self._fresh_count = released
             self._fresh_at = time.monotonic()
+            # A released unit appears where it belongs and fades in; only a real
+            # jump should be parked off the right edge. See _compensate_insertion.
+            self._compensate_insertion()
         return bool(released)
 
     def _flush_release(self) -> None:
@@ -1394,16 +1409,30 @@ class SubtitleWindow(QWidget):
                 self._fresh_at,
             )
 
-    def _compensate_insertion(self) -> None:
-        """Park newly arrived text off to the right for the animation to carry in.
+    def _typical_unit_px(self) -> float:
+        """Width of one reading unit at the current font, roughly."""
+        tw = self._text_widgets[0] if self._text_widgets else None
+        if tw is None:
+            return 0.0
+        return float(QFontMetrics(tw._font).horizontalAdvance("中") or 16)
 
-        Without this the whole line jumps left by the width of every new chunk.
-        Only *text* growth is compensated -- the pause gap is meant to push the
-        line along, since that is what shows time passing.
+    def _compensate_insertion(self) -> None:
+        """Park a large jump of new text off to the right for the animation to carry in.
+
+        A jump is only compensated when it is markedly bigger than one reading
+        unit. With paced release a unit lands several times a second, and parking
+        each one off the right edge reads as the caption perpetually sliding
+        itself back in -- which is not the cue we want. A single unit simply
+        appears where it belongs and fades in, which is what marks it as new.
+
+        Only *text* growth is considered at all: the pause gap is meant to push
+        the line along, since that is what shows time passing.
         """
         width = self._marquee_text_width()
-        if self._last_text_width and width > self._last_text_width:
-            self._slide_px += width - self._last_text_width
+        if self._last_text_width:
+            growth = width - self._last_text_width
+            if growth > self._typical_unit_px() * 1.6:
+                self._slide_px += growth
         self._last_text_width = width
 
     def _marquee_text_width(self) -> float:
