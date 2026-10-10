@@ -88,6 +88,15 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # steady drift. The drift itself is derived from release_units_per_s, so there
     # is normally nothing to catch up on.
     "belt_catchup_s": 0.35,
+    # The belt's correcting term: how quickly the newest character is pulled back
+    # to its resting place. Smaller is firmer, larger is smoother.
+    "belt_settle_s": 0.18,
+    # Stale fade. Under continuous speech this never engages -- content keeps
+    # arriving and the clock keeps resetting. It exists for a pause long enough
+    # that the caption would otherwise sit mid-screen showing finished material.
+    # Deliberately shorter than auto_hide_timeout, so the fade happens first.
+    "stale_hold_ms": 4000,
+    "stale_fade_ms": 900,
     # How long a newly released unit takes to fade in -- the visual cue for
     # "this is what just appeared".
     "fresh_fade_in_ms": 220,
@@ -251,6 +260,7 @@ class _SubtitleTextWidget(QWidget):
         # owned by the window, not something derived from the content width -- see
         # _advance_belt. Deriving it was what made every insertion move the line.
         self._marquee_belt_x = 0.0
+        self._marquee_alpha = 1.0
         # Trailing units that were just released, and when. They fade in, which is
         # the cue for "this is the part that is new" -- without it the reader has
         # to re-scan the whole line to work out where the addition starts.
@@ -511,7 +521,7 @@ class _SubtitleTextWidget(QWidget):
 
     def set_marquee(self, items: list, belt_x: float = 0.0,
                     fresh_units: int = 0, fresh_at: float = 0.0,
-                    corrections: list = None) -> None:
+                    corrections: list = None, stale_alpha: float = 1.0) -> None:
         """Render a single, non-wrapping line that scrolls like a teleprompter.
 
         ``items`` is ``[[text, gap_px_after], ...]``. The gap after a segment is
@@ -531,6 +541,9 @@ class _SubtitleTextWidget(QWidget):
         """
         self._marquee = [[str(t), float(g or 0.0)] for t, g in items]
         self._marquee_belt_x = float(belt_x)
+        # Line-wide opacity, used for the stale fade. Applied on top of the
+        # per-unit alphas so marking new text keeps working while it falls away.
+        self._marquee_alpha = max(0.0, min(1.0, float(stale_alpha)))
         self._fresh_units = max(0, int(fresh_units))
         self._fresh_at = float(fresh_at or 0.0)
         # Entries are [units_from_end, count, age]; age drives the fade.
@@ -668,7 +681,7 @@ class _SubtitleTextWidget(QWidget):
                 if ui >= fresh_from and self._fresh_units and self._fresh_at:
                     elapsed = time.monotonic() - self._fresh_at
                     fade_in = min(1.0, elapsed / max(0.01, self._fresh_fade_in_s))
-                fade_in = min(fade_in, corrected_fade.get(ui, 1.0))
+                fade_in = min(fade_in, corrected_fade.get(ui, 1.0)) * self._marquee_alpha
                 ux = snap(x)
                 uw = fm.horizontalAdvance(unit)
                 self._draw_marquee_unit(
@@ -757,7 +770,7 @@ class _SubtitleTextWidget(QWidget):
             return
 
         colour = QColor(self._color)
-        colour.setAlphaF(colour.alphaF() * 0.85 * alpha)
+        colour.setAlphaF(colour.alphaF() * 0.85 * alpha * self._marquee_alpha)
         pen = QPen(colour)
         pen.setWidthF(max(1.0, self._outline_width * 0.9))
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -892,6 +905,10 @@ class SubtitleWindow(QWidget):
         self._belt_growth = 0.0
         self._belt_meter_at = 0.0
         self._belt_meter_px = 0.0
+        # When the line last gained content. A pause long enough to leave the
+        # caption sitting mid-screen is time the speaker has already moved on
+        # from, so the line fades rather than lingering as stale text.
+        self._stale_at = 0.0
         self._last_tick = 0.0
         # Paced release. The recogniser hands over a whole phrase at once, which
         # lands as one lump the reader has to re-scan to find the new part, and
@@ -1281,6 +1298,7 @@ class SubtitleWindow(QWidget):
             # would go on widening while the words are already on screen.
             self._mark_text_arrived()
         self._queue_partial(text)
+        self._mark_content()
         if text:
             self._restart_auto_hide_timer()
         # Content changed, so re-render through the normal path: that is also
@@ -1340,6 +1358,7 @@ class SubtitleWindow(QWidget):
         self._live_gap_px = 0.0
         self._frozen_gap = None
         self._last_text_at = time.monotonic()
+        self._mark_content()
         self._released_tail = ""
         self._display_tail = ""
         self._release_queue = ""
@@ -1517,6 +1536,13 @@ class SubtitleWindow(QWidget):
 
         # Keep ticking while a fade-in or a correction mark is still playing:
         # stopping here would leave them frozen part-way.
+        stale = self._stale_alpha(now)
+        if stale < 1.0:
+            moved = True
+            if stale <= 0.0:
+                # Fully faded: drop the line so the belt starts fresh next time.
+                self.clear()
+                return
         fade = max(0.0, float(self._settings.get("fresh_fade_in_ms", 220)) / 1000.0)
         if self._fresh_count and self._fresh_at and (now - self._fresh_at) < fade:
             moved = True
@@ -1553,6 +1579,7 @@ class SubtitleWindow(QWidget):
                 self._fresh_count,
                 self._fresh_at,
                 self._live_corrections(),
+                self._stale_alpha(),
             )
 
     def _typical_unit_px(self) -> float:
@@ -1650,18 +1677,25 @@ class SubtitleWindow(QWidget):
                 - self._belt_rest_x(tw))
 
     def _belt_speed(self) -> float:
-        """Leftward drift, matched to how fast the line is actually growing.
+        """Leftward drift: a feed-forward estimate plus a correcting term.
 
-        Matching it is what holds the newest character at the right edge: if the
-        belt carries text in at the same rate it arrives, the right end stays put
-        and everything ahead of it is what moves. Nothing moves while nothing is
-        being said, which is right -- a still caption should be still.
+        The feed-forward term is the measured content growth, which is what keeps
+        the newest character at the right edge while text is arriving steadily.
+        Measured rather than assumed, because the line grows from the pause gaps
+        widening as well as from characters.
 
-        The rate is *measured*, not assumed. Assuming the character rate alone is
-        wrong, because the line also grows as the pause gaps widen, and a drift tied
-        only to characters falls behind -- measured, the newest text ended up 325px
-        past the right edge. The measurement is smoothed so a burst does not lurch
-        the belt, and the catch-up term bounds how far anything can lag.
+        The feed-forward on its own is not enough, and getting this wrong is easy:
+        any mismatch between it and the instantaneous growth shows up as the
+        insertion point sliding along the line rather than staying where the reader
+        expects. That is what the second term is for -- it corrects on the *signed*
+        distance between the newest character and its resting place, so the belt is
+        pulled back when it has run ahead exactly as it is pushed when it has
+        fallen behind. Only correcting one direction (as this used to) lets the
+        error accumulate: uneven speech drifts the insertion point either way, and
+        a pause leaves the belt still running, carrying it far to the left.
+
+        The result never runs backwards, so text does not retreat rightwards; when
+        the belt is ahead it simply stops and the arriving text closes the gap.
         """
         now = time.monotonic()
         width = self._marquee_content_width()
@@ -1670,17 +1704,15 @@ class SubtitleWindow(QWidget):
         elif (now - self._belt_meter_at) >= 0.1:
             elapsed = now - self._belt_meter_at
             rate = (width - self._belt_meter_px) / elapsed
-            self._belt_growth = 0.7 * self._belt_growth + 0.3 * max(0.0, rate)
+            # Signed, so the estimate falls away during a pause instead of coasting.
+            self._belt_growth = 0.6 * self._belt_growth + 0.4 * rate
             self._belt_meter_at, self._belt_meter_px = now, width
 
-        speed = self._belt_growth
-        overflow = self._belt_overflow()
-        if overflow > 0.0:
-            speed = max(
-                speed,
-                overflow / max(0.15, float(self._settings.get("belt_catchup_s", 0.35))),
-            )
-        return speed
+        feedback_tau = max(
+            0.08, float(self._settings.get("belt_settle_s", 0.18))
+        )
+        speed = max(0.0, self._belt_growth) + self._belt_overflow() / feedback_tau
+        return max(0.0, speed)
 
     def _belt_position(self, tw) -> float:
         """Left edge of the line in widget coordinates.
@@ -1720,6 +1752,27 @@ class SubtitleWindow(QWidget):
             gap = self._gaps.pop(0) if self._gaps else 0.0
             self._sentences.pop(0)
             self._belt_x += width + float(gap or 0.0)
+
+    def _stale_alpha(self, now: float = None) -> float:
+        """Opacity of the line, falling away once it has gone stale.
+
+        Under continuous speech this never engages: content keeps arriving and the
+        clock keeps resetting. It only comes into play after a pause long enough
+        that the caption would otherwise sit in the middle of the screen showing
+        what the speaker has already finished with.
+        """
+        if not self._stale_at:
+            return 1.0
+        hold = max(0.0, float(self._settings.get("stale_hold_ms", 4000)) / 1000.0)
+        fade = max(0.01, float(self._settings.get("stale_fade_ms", 900)) / 1000.0)
+        elapsed = (now if now is not None else time.monotonic()) - self._stale_at
+        if elapsed <= hold:
+            return 1.0
+        return max(0.0, 1.0 - (elapsed - hold) / fade)
+
+    def _mark_content(self) -> None:
+        """Note that the line just gained content, holding the stale fade off."""
+        self._stale_at = time.monotonic()
 
     def _advance_belt(self, dt: float) -> bool:
         """Drift the line left at a steady speed and recycle what has left view."""
@@ -1766,7 +1819,7 @@ class SubtitleWindow(QWidget):
                     items = self._marquee_items(line_type, cfg)
                 tw.set_marquee(
                     items, self._belt_position(tw), self._fresh_count, self._fresh_at,
-                    self._live_corrections(),
+                    self._live_corrections(), self._stale_alpha(),
                 )
                 wi += 1
                 continue
@@ -1832,6 +1885,10 @@ class SubtitleWindow(QWidget):
         self._belt_growth = 0.0
         self._belt_meter_at = 0.0
         self._belt_meter_px = 0.0
+        # When the line last gained content. A pause long enough to leave the
+        # caption sitting mid-screen is time the speaker has already moved on
+        # from, so the line fades rather than lingering as stale text.
+        self._stale_at = 0.0
         self._marquee_timer.stop()
         self._cancel_pending_segments()
         self._auto_hide_timer.stop()

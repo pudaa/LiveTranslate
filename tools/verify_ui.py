@@ -747,6 +747,64 @@ def _short_utterance_threshold():
     return "CJK clauses kept; fillers filtered; Latin unchanged"
 
 
+
+def _belt_tracking_and_stale():
+    """The insertion point must hold its place, and stale text must fade.
+
+    Two things reported from use. Uneven speech made new text appear to the left
+    or right of where it was expected, and a pause did not stop the belt, carrying
+    the insertion point far left. The cause was one-sided correction: the belt was
+    pushed when it fell behind but never pulled back when it ran ahead, so the
+    error accumulated. Separately, a long pause left finished text sitting in the
+    middle of the screen.
+    """
+    from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS, SubtitleWindow
+
+    win = SubtitleWindow(dict(DEFAULT_SUBTITLE_WIN_SETTINGS))
+    win.show()
+    _APP.processEvents()
+    win.update_partial("正在说的一段内容")
+    for _ in range(400):
+        if win._release_step(0.016):
+            win._render_marquee()
+        if not win._release_queue:
+            break
+
+    # Uneven arrival: bursts of differing size must not accumulate a drift.
+    offsets = []
+    for burst in (1, 3, 1, 5, 2, 1, 0, 4, 1, 2, 7, 1):
+        for _ in range(burst):
+            win._release_step(0.016)
+        _frames(win, 6)
+        offsets.append(abs(win._belt_overflow()))
+    assert offsets[-1] < 8.0, f"the insertion point drifted: {offsets}"
+
+    # A pause must stop the belt, not carry the insertion point away.
+    _frames(win, int(2.0 / 0.016))
+    assert abs(win._belt_overflow()) < 8.0, (
+        f"a pause carried the insertion point {win._belt_overflow():.0f}px away"
+    )
+    assert win._belt_speed() < 5.0, "the belt kept running through a pause"
+
+    # Stale fade: not while content keeps arriving, yes after a long pause.
+    win._mark_content()
+    assert win._stale_alpha() == 1.0, "the stale fade engaged during speech"
+    hold = DEFAULT_SUBTITLE_WIN_SETTINGS["stale_hold_ms"] / 1000.0
+    fade = DEFAULT_SUBTITLE_WIN_SETTINGS["stale_fade_ms"] / 1000.0
+    base = win._stale_at
+    assert win._stale_alpha(base + hold - 0.1) == 1.0, "the fade began before the hold"
+    assert win._stale_alpha(base + hold + fade * 0.5) < 0.7, "the fade did not progress"
+    assert win._stale_alpha(base + hold + fade + 0.1) == 0.0, "the fade never finished"
+    win._mark_content()
+    assert win._stale_alpha() == 1.0, "new content did not clear the stale fade"
+
+    win.close()
+    return (
+        f"insertion point holds ({offsets[-1]:.1f}px after uneven bursts, belt stops "
+        f"on a pause); stale fade {hold:.1f}s + {fade:.1f}s"
+    )
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -765,6 +823,7 @@ def main() -> int:
     check("13. ASR text released one unit at a time", _subtitle_paced_release)
     check("14. bottom-anchored; revision replaces; no park", _subtitle_anchor_and_revision)
     check("15. fragment heuristic is script-aware", _short_utterance_threshold)
+    check("16. insertion point holds; stale text fades", _belt_tracking_and_stale)
 
     print("PASSED:")
     for p in PASS:
