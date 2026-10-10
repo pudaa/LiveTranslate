@@ -90,6 +90,11 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # How long a corrected span keeps its dotted under-rule. A cue, not an alarm:
     # long enough to notice, short enough not to accumulate into clutter.
     "correction_mark_ms": 2500,
+    # A just-corrected unit materialises from correction_fade_from to full over
+    # correction_fade_in_ms. Starting partly visible, rather than from nothing, is
+    # what keeps it distinguishable from genuinely new text.
+    "correction_fade_in_ms": 320,
+    "correction_fade_from": 0.45,
     # Minimum time a sentence stays up before it may be replaced, in ms.
     # Applied by delaying the replacement, so a large value makes live captions
     # lag the audio; 0 disables the throttle.
@@ -247,6 +252,8 @@ class _SubtitleTextWidget(QWidget):
         self._corrections: list = []
         self._fresh_fade_in_s = 0.22
         self._correction_mark_s = 2.5
+        self._correction_fade_in_s = 0.32
+        self._correction_fade_from = 0.45
         self._fade_out_px = 96
 
     # --- pyqtProperty for content opacity ---
@@ -292,6 +299,12 @@ class _SubtitleTextWidget(QWidget):
         self._fade_out_px = int(cfg.get("fade_out_px", 96))
         self._fresh_fade_in_s = max(0.0, float(cfg.get("fresh_fade_in_ms", 220)) / 1000.0)
         self._correction_mark_s = max(0.0, float(cfg.get("correction_mark_ms", 2500)) / 1000.0)
+        self._correction_fade_in_s = max(
+            0.0, float(cfg.get("correction_fade_in_ms", 320)) / 1000.0
+        )
+        self._correction_fade_from = max(
+            0.0, min(1.0, float(cfg.get("correction_fade_from", 0.45)))
+        )
         resolved = _resolve_image_path(cfg.get("bg_image", ""))
         self._bg_pixmap = QPixmap(resolved) if resolved else None
         self._entry_animation = cfg.get("entry_animation", "none")
@@ -627,10 +640,15 @@ class _SubtitleTextWidget(QWidget):
         all_units = [u for text, _ in self._marquee for u in split_marquee_units(str(text))]
         fresh_from = max(0, len(all_units) - self._fresh_units)
         corrected = set()
+        corrected_fade = {}
         for entry in self._corrections:
             # Entries are [units_from_end, count, age] -- unpack explicitly.
             start = len(all_units) - int(entry[0])
-            corrected.update(range(start, start + int(entry[1])))
+            age = float(entry[2]) if len(entry) > 2 else 0.0
+            fade = self._correction_fade(age)
+            for index in range(start, start + int(entry[1])):
+                corrected.add(index)
+                corrected_fade[index] = max(corrected_fade.get(index, 0.0), fade)
         spans = []
         ui = 0
         for text, gap in self._marquee:
@@ -639,6 +657,7 @@ class _SubtitleTextWidget(QWidget):
                 if ui >= fresh_from and self._fresh_units and self._fresh_at:
                     elapsed = time.monotonic() - self._fresh_at
                     fade_in = min(1.0, elapsed / max(0.01, self._fresh_fade_in_s))
+                fade_in = min(fade_in, corrected_fade.get(ui, 1.0))
                 ux = snap(x)
                 uw = fm.horizontalAdvance(unit)
                 self._draw_marquee_unit(
@@ -691,6 +710,20 @@ class _SubtitleTextWidget(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(colour))
         painter.drawPath(path)
+
+    def _correction_fade(self, age: float) -> float:
+        """Visibility of a just-corrected unit, as a gentle materialisation.
+
+        Deliberately weaker than the fade-in new text gets: starting from a
+        partly visible value reads as "this changed", whereas starting from
+        nothing reads as "this is new" -- the cue the reader must not confuse it
+        with. It settles at full strength after correction_fade_in_ms.
+        """
+        fade = max(0.0, self._correction_fade_in_s)
+        if fade <= 0:
+            return 1.0
+        floor = max(0.0, min(1.0, self._correction_fade_from))
+        return floor + (1.0 - floor) * min(1.0, max(0.0, age / fade))
 
     def _draw_correction_marks(self, painter, spans, baseline, fm):
         """Rule a fine dotted line under the spans the recogniser corrected.

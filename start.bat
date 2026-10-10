@@ -44,6 +44,13 @@ if /i "%~1"=="verify" goto do_verify
 if /i "%~1"=="gpu" goto do_gpu
 if /i "%~1"=="audio" goto do_audio
 
+REM Refuse to start a second instance. Two copies fight over the audio device and
+REM the subtitle window, and the second one cannot even claim the log file.
+REM Checked before the banner, so the banner only prints for a run that proceeds.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "exit [int](@(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*main.py*' }).Count)" >nul 2>&1
+if errorlevel 1 goto already_running
+
 echo ============================================================
 echo  LiveTranslate
 echo  python : %PY%
@@ -55,9 +62,15 @@ echo Full log: %LOGDIR%\app_start.log
 echo.
 
 REM Tee stdout+stderr to a log so a crash that kills the window is still
-REM diagnosable afterwards.
+REM diagnosable afterwards. Claim the file first: if something else holds it (a
+REM stale instance, an editor), fall back to running without the log rather than
+REM failing to start at all.
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "& '%PY%' '%~dp0main.py' 2>&1 | Tee-Object -FilePath '%LOGDIR%\app_start.log'"
+  "$py='%PY%'; $main='%~dp0main.py'; $log='%LOGDIR%\app_start.log';" ^
+  "try { $f=[IO.File]::Open($log,'Append','Write','None'); $f.Close();" ^
+  "  & $py $main 2>&1 | Tee-Object -FilePath $log }" ^
+  "catch { Write-Host '[warn] could not write the log file; output will not be saved';" ^
+  "  & $py $main }"
 
 set "RC=%ERRORLEVEL%"
 echo.
@@ -65,6 +78,25 @@ if not "%RC%"=="0" goto app_failed
 echo LiveTranslate exited normally.
 endlocal
 exit /b 0
+
+:already_running
+echo [ERROR] LiveTranslate is already running.
+echo.
+echo   Two copies compete for the audio device and the subtitle window, so the
+echo   second one is not started.
+echo.
+echo   Find it with:
+echo     Get-CimInstance Win32_Process -Filter "Name='python.exe'" ^|
+echo       Where-Object { $_.CommandLine -like '*main.py*' }
+echo.
+echo   Close that window (or Ctrl+C in it) and try again.
+echo.
+echo   Alternatively, the leftover may be holding %LOGDIR%\app_start.log --
+echo   closing whatever has that open is enough.
+echo.
+pause
+endlocal
+exit /b 1
 
 :app_failed
 echo [ERROR] LiveTranslate exited with code %RC%

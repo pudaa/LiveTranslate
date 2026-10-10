@@ -628,6 +628,13 @@ def _subtitle_anchor_and_revision():
         f"a shorter correction moved the line by {after - before:+.0f}px"
     )
 
+    # A corrected unit materialises from a partly visible value, not from nothing.
+    # Starting from nothing is the cue that means "this is new", and confusing the
+    # two is exactly what the marking is meant to avoid.
+    assert tw._correction_fade(0.0) > 0.2, "a correction starts from invisible"
+    assert tw._correction_fade(0.0) < 0.9, "a correction is not visibly gentle"
+    assert tw._correction_fade(10.0) >= 0.999, "a correction never reaches full strength"
+
     win.close()
     return (
         "bottom edge held; revision replaced in place; one-unit release not parked; "
