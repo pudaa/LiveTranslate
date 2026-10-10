@@ -17,7 +17,7 @@ from pathlib import Path
 import json
 
 from PyQt6.QtCore import (
-    Qt, QPoint, QRect, pyqtSignal, pyqtSlot, pyqtProperty,
+    Qt, QPoint, QPointF, QRect, pyqtSignal, pyqtSlot, pyqtProperty,
     QPropertyAnimation, QParallelAnimationGroup, QEasingCurve, QTimer,
 )
 from PyQt6.QtGui import (
@@ -87,6 +87,9 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # How long a newly released unit takes to fade in -- the visual cue for
     # "this is what just appeared".
     "fresh_fade_in_ms": 220,
+    # How long a corrected span keeps its dotted under-rule. A cue, not an alarm:
+    # long enough to notice, short enough not to accumulate into clutter.
+    "correction_mark_ms": 2500,
     # Minimum time a sentence stays up before it may be replaced, in ms.
     # Applied by delaying the replacement, so a large value makes live captions
     # lag the audio; 0 disables the throttle.
@@ -241,7 +244,9 @@ class _SubtitleTextWidget(QWidget):
         # to re-scan the whole line to work out where the addition starts.
         self._fresh_units = 0
         self._fresh_at = 0.0
+        self._corrections: list = []
         self._fresh_fade_in_s = 0.22
+        self._correction_mark_s = 2.5
         self._fade_out_px = 96
 
     # --- pyqtProperty for content opacity ---
@@ -286,6 +291,7 @@ class _SubtitleTextWidget(QWidget):
         self._scroll_mode = bool(cfg.get("scroll", False))
         self._fade_out_px = int(cfg.get("fade_out_px", 96))
         self._fresh_fade_in_s = max(0.0, float(cfg.get("fresh_fade_in_ms", 220)) / 1000.0)
+        self._correction_mark_s = max(0.0, float(cfg.get("correction_mark_ms", 2500)) / 1000.0)
         resolved = _resolve_image_path(cfg.get("bg_image", ""))
         self._bg_pixmap = QPixmap(resolved) if resolved else None
         self._entry_animation = cfg.get("entry_animation", "none")
@@ -484,7 +490,8 @@ class _SubtitleTextWidget(QWidget):
         return segments or [text]
 
     def set_marquee(self, items: list, slide_px: float = 0.0,
-                    fresh_units: int = 0, fresh_at: float = 0.0) -> None:
+                    fresh_units: int = 0, fresh_at: float = 0.0,
+                    corrections: list = None) -> None:
         """Render a single, non-wrapping, right-anchored line.
 
         ``items`` is ``[[text, gap_px_after], ...]``. The gap after a segment is
@@ -502,6 +509,11 @@ class _SubtitleTextWidget(QWidget):
         self._marquee_slide_px = float(slide_px or 0.0)
         self._fresh_units = max(0, int(fresh_units))
         self._fresh_at = float(fresh_at or 0.0)
+        # Entries are [units_from_end, count, age]; age drives the fade.
+        self._corrections = [
+            [int(e[0]), int(e[1]), float(e[2]) if len(e) > 2 else 0.0]
+            for e in (corrections or [])
+        ]
         # Reset the entry/exit animation state the way set_text() does. A value
         # left over from an unrelated animate_out() would otherwise keep the line
         # faded or offset, since this path does not go through set_text().
@@ -614,6 +626,12 @@ class _SubtitleTextWidget(QWidget):
         x = float(w - ow - self.marquee_width() + self._marquee_slide_px)
         all_units = [u for text, _ in self._marquee for u in split_marquee_units(str(text))]
         fresh_from = max(0, len(all_units) - self._fresh_units)
+        corrected = set()
+        for entry in self._corrections:
+            # Entries are [units_from_end, count, age] -- unpack explicitly.
+            start = len(all_units) - int(entry[0])
+            corrected.update(range(start, start + int(entry[1])))
+        spans = []
         ui = 0
         for text, gap in self._marquee:
             for unit in split_marquee_units(str(text)):
@@ -621,12 +639,20 @@ class _SubtitleTextWidget(QWidget):
                 if ui >= fresh_from and self._fresh_units and self._fresh_at:
                     elapsed = time.monotonic() - self._fresh_at
                     fade_in = min(1.0, elapsed / max(0.01, self._fresh_fade_in_s))
+                ux = snap(x)
+                uw = fm.horizontalAdvance(unit)
                 self._draw_marquee_unit(
-                    painter, fm, unit, snap(x), baseline, outline_pen, fade_in
+                    painter, fm, unit, ux, baseline, outline_pen, fade_in
                 )
-                x += fm.horizontalAdvance(unit)
+                if ui in corrected and unit.strip():
+                    if spans and abs(spans[-1][1] - ux) < 1.0:
+                        spans[-1][1] = ux + uw  # merge with the previous unit
+                    else:
+                        spans.append([ux, ux + uw])
+                x += uw
                 ui += 1
             x += gap
+        self._draw_correction_marks(painter, spans, baseline, fm)
 
         painter.end()
         self._text_cache = pix
@@ -665,6 +691,38 @@ class _SubtitleTextWidget(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(colour))
         painter.drawPath(path)
+
+    def _draw_correction_marks(self, painter, spans, baseline, fm):
+        """Rule a fine dotted line under the spans the recogniser corrected.
+
+        A dotted rule rather than a flash. A flash reads as "this is new", which is
+        the cue the fade-in already carries, so the reader re-reads the whole span
+        before finding that only a word or two changed -- worse than no cue at all.
+        A rule underneath is legible as an annotation without competing with the
+        text, and it fades out on its own.
+        """
+        if not spans or not self._corrections or self._correction_mark_s <= 0:
+            return
+        ttl = self._correction_mark_s
+        alpha = 0.0
+        for entry in self._corrections:
+            age = entry[2] if len(entry) > 2 else 0.0
+            # Fade over the last 0.6s rather than vanishing outright.
+            alpha = max(alpha, min(1.0, max(0.0, (ttl - age) / 0.6)))
+        if alpha <= 0.0:
+            return
+
+        colour = QColor(self._color)
+        colour.setAlphaF(colour.alphaF() * 0.85 * alpha)
+        pen = QPen(colour)
+        pen.setWidthF(max(1.0, self._outline_width * 0.9))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setDashPattern([1.0, 2.0])  # fine dots, not a solid rule
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        y = min(self.height() - 1.0, baseline + max(2.0, fm.descent() * 0.6))
+        for x0, x1 in spans:
+            painter.drawLine(QPointF(x0, y), QPointF(x1, y))
 
     def _render_text_pixmap(self):
         if self._scroll_mode:
@@ -789,10 +847,18 @@ class SubtitleWindow(QWidget):
         # unit at a time instead: every addition is then the same size and
         # appears in the same place, with no re-scanning.
         self._release_queue = ""   # units recognised but not on screen yet
-        self._released_tail = ""   # the in-progress text actually being shown
+        self._released_tail = ""   # recognised text actually on screen
+        # What is *rendered* for that tail. Kept separate from _released_tail
+        # because a correction pads the replacement to preserve the line's width,
+        # and padding must not pollute the watermark the prefix check runs on.
+        self._display_tail = ""
         self._release_credit = 0.0
         self._fresh_count = 0
         self._fresh_at = 0.0
+        # Corrections currently being marked: [units from the end, unit count,
+        # when applied]. Counted from the end because text is only ever appended
+        # there or trimmed from the front, so the offset stays valid.
+        self._corrections: list[list] = []
         self._marquee_timer = QTimer(self)
         self._marquee_timer.setInterval(16)  # ~60fps
         self._marquee_timer.timeout.connect(self._tick_marquee)
@@ -1199,10 +1265,20 @@ class SubtitleWindow(QWidget):
 
     def _insert_sentence(self, original: str, translations: dict):
         """Insert a single sentence and refresh display."""
+        # Put up anything still buffered first, so the committed line is complete
+        # and _display_tail holds the whole recognised text.
+        self._flush_release()
+
+        # Carry the padded display text into the sentence. The padding exists to
+        # hold the line's width steady through a correction; dropping it here would
+        # shift everything again, at the moment the reader is most likely to still
+        # be looking at the corrected words. The transcript is unaffected --
+        # main.py writes the true text before the window ever sees it.
+        display = self._display_tail if self._display_tail != self._released_tail else original
 
         max_sentences = self._settings.get("sentences", 1)
         # Mutable entries: the marquee trims leading characters in place.
-        self._sentences.append([original, translations])
+        self._sentences.append([display, translations])
         if self._scroll_line_config() is None:
             # Wrapped mode keeps count-based expiry. Scroll mode decays by width
             # instead, so nothing jumps when a sentence ages out.
@@ -1215,14 +1291,12 @@ class SubtitleWindow(QWidget):
                 self._gaps[-1] = silence
             while len(self._gaps) < len(self._sentences):
                 self._gaps.append(0.0)
+
         self._live_gap_px = 0.0
         self._frozen_gap = None
         self._last_text_at = time.monotonic()
-        # The committed sentence takes over from the in-progress tail. Put up
-        # anything still buffered first so the committed line is complete, then
-        # hand the tail over to the sentence list.
-        self._flush_release()
         self._released_tail = ""
+        self._display_tail = ""
         self._release_queue = ""
         self._release_credit = 0.0
         # The committed text now covers whatever the partial line was showing.
@@ -1251,6 +1325,48 @@ class SubtitleWindow(QWidget):
                 return cfg
         return None
 
+    def _pad_replacement(self, old_text: str, new_text: str) -> str:
+        """Pad ``new_text`` so it occupies the same width as ``old_text``.
+
+        A correction must not change the line's total width: because the line is
+        right-anchored, even a one-character difference shifts everything to the
+        left of it, and the reader loses the place they had.
+
+        The padding is exact for CJK, which is the common case: a CJK font's
+        advances are one em each and U+3000 is exactly that width. Anything else
+        (Latin, digits) is approximated and the residue is left to the slide
+        animation, which is why the residue is returned too.
+        """
+        tw = self._text_widgets[0] if self._text_widgets else None
+        if tw is None or not old_text:
+            return new_text
+        fm = QFontMetrics(tw._font)
+        deficit = fm.horizontalAdvance(old_text) - fm.horizontalAdvance(new_text)
+        if deficit <= 0:
+            return new_text
+        pad_char = "\u3000" if fm.horizontalAdvance("\u3000") > 0 else " "
+        pad_w = fm.horizontalAdvance(pad_char) or 1
+        return new_text + pad_char * int(deficit // pad_w)
+
+    def _mark_correction(self, units_from_end: int, count: int) -> None:
+        """Record a corrected span so it can be underlined for a while."""
+        if count <= 0 or units_from_end <= 0:
+            return
+        self._corrections = [
+            c for c in self._corrections if not (c[0] == units_from_end and c[1] == count)
+        ]
+        self._corrections.append([units_from_end, count, time.monotonic()])
+
+    def _live_corrections(self) -> list:
+        """Corrections still inside their marking window, as (from_end, count, age)."""
+        ttl = max(0.0, float(self._settings.get("correction_mark_ms", 2500)) / 1000.0)
+        if ttl <= 0:
+            self._corrections.clear()
+            return []
+        now = time.monotonic()
+        self._corrections = [c for c in self._corrections if now - c[2] < ttl]
+        return [(c[0], c[1], now - c[2]) for c in self._corrections]
+
     def _queue_partial(self, text: str) -> None:
         """Buffer the part of the in-progress text that is not on screen yet.
 
@@ -1265,14 +1381,31 @@ class SubtitleWindow(QWidget):
         # The recogniser revised what it had rather than extending it (SenseVoice
         # corrects earlier guesses: 它是 -> 他是). Replace the in-progress text in
         # place. Re-queueing the whole sentence, as this used to, showed the words
-        # already on screen a second time -- which is what made the caption look
-        # like it kept sliding the same content in again.
+        # already on screen a second time.
         keep = 0
         common = min(len(text), len(self._released_tail))
         while keep < common and text[keep] == self._released_tail[keep]:
             keep += 1
-        self._released_tail = text[:keep]
-        self._release_queue = text[keep:]
+
+        changed_old = self._released_tail[keep:]
+        changed_new = text[keep:]
+        padded = self._pad_replacement(changed_old, changed_new)
+        self._display_tail = self._display_tail[:keep] + padded
+        self._released_tail = text
+        self._release_queue = ""
+        self._release_credit = 0.0
+
+        # Residual growth the padding could not absorb: hand it to the slide so the
+        # line eases into its new position instead of jumping.
+        tw = self._text_widgets[0] if self._text_widgets else None
+        if tw is not None:
+            fm = QFontMetrics(tw._font)
+            residual = fm.horizontalAdvance(changed_new) - fm.horizontalAdvance(changed_old)
+            if residual > 0:
+                self._slide_px += residual
+
+        from_end = len(split_marquee_units(padded)) if changed_new else 0
+        self._mark_correction(from_end, len(split_marquee_units(changed_new)))
 
     def _release_step(self, dt: float) -> bool:
         """Show at most a little more of the buffered text. True if anything moved.
@@ -1297,6 +1430,7 @@ class SubtitleWindow(QWidget):
         while self._release_credit >= 1.0 and self._release_queue:
             head = split_marquee_units(self._release_queue)[0]
             self._released_tail += head
+            self._display_tail += head
             self._release_queue = self._release_queue[len(head):]
             self._release_credit -= 1.0
             released += 1
@@ -1313,6 +1447,7 @@ class SubtitleWindow(QWidget):
         if not self._release_queue:
             return
         self._released_tail += self._release_queue
+        self._display_tail += self._release_queue
         self._fresh_count = len(split_marquee_units(self._release_queue))
         self._fresh_at = time.monotonic()
         self._release_queue = ""
@@ -1369,10 +1504,13 @@ class SubtitleWindow(QWidget):
             self._live_gap_px = gap
             moved = True
 
-        # Keep ticking while a fade-in is still playing: stopping here would
-        # leave the newest units frozen part-way faded.
+        # Keep ticking while a fade-in or a correction mark is still playing:
+        # stopping here would leave them frozen part-way.
         fade = max(0.0, float(self._settings.get("fresh_fade_in_ms", 220)) / 1000.0)
         if self._fresh_count and self._fresh_at and (now - self._fresh_at) < fade:
+            moved = True
+        mark_ttl = max(0.0, float(self._settings.get("correction_mark_ms", 2500)) / 1000.0)
+        if any(now - c[2] < mark_ttl for c in self._corrections):
             moved = True
 
         if not moved:
@@ -1407,6 +1545,7 @@ class SubtitleWindow(QWidget):
                 self._slide_px,
                 self._fresh_count,
                 self._fresh_at,
+                self._live_corrections(),
             )
 
     def _typical_unit_px(self) -> float:
@@ -1431,7 +1570,7 @@ class SubtitleWindow(QWidget):
         width = self._marquee_text_width()
         if self._last_text_width:
             growth = width - self._last_text_width
-            if growth > self._typical_unit_px() * 1.6:
+            if abs(growth) > self._typical_unit_px() * 1.6:
                 self._slide_px += growth
         self._last_text_width = width
 
@@ -1445,7 +1584,7 @@ class SubtitleWindow(QWidget):
         for original in (s[0] for s in self._sentences):
             for unit in split_marquee_units(original):
                 total += fm.horizontalAdvance(unit)
-        for unit in split_marquee_units(self._released_tail):
+        for unit in split_marquee_units(self._display_tail):
             total += fm.horizontalAdvance(unit)
         return total
 
@@ -1465,8 +1604,8 @@ class SubtitleWindow(QWidget):
                 # resumes, then stops.
                 gap = self._pause_gap_px()
             items.append([text, gap])
-        if self._released_tail:
-            items.append([self._released_tail, 0.0])
+        if self._display_tail:
+            items.append([self._display_tail, 0.0])
         return items
 
     @staticmethod
@@ -1498,7 +1637,7 @@ class SubtitleWindow(QWidget):
         fm = QFontMetrics(tw._font)
         for _ in range(200):  # bounded: each pass drops at least one character
             total = sum(fm.horizontalAdvance(s[0]) for s in self._sentences)
-            total += sum(self._gaps) + fm.horizontalAdvance(self._released_tail)
+            total += sum(self._gaps) + fm.horizontalAdvance(self._display_tail)
             if total <= limit or not self._sentences:
                 return
             head = self._sentences[0][0]
@@ -1517,7 +1656,7 @@ class SubtitleWindow(QWidget):
         # The in-progress line counts as content: at the start of an utterance
         # there are no committed sentences yet, and that is exactly when the
         # caption most needs to be on screen.
-        if not self._sentences and not self._released_tail and not self._release_queue:
+        if not self._sentences and not self._display_tail and not self._release_queue:
             for tw in self._text_widgets:
                 tw.set_text("")
             self._fit_height_snap()
@@ -1538,7 +1677,10 @@ class SubtitleWindow(QWidget):
                     self._trim_marquee(tw)
                     items = self._marquee_items(line_type, cfg)
                     self._compensate_insertion()
-                tw.set_marquee(items, self._slide_px, self._fresh_count, self._fresh_at)
+                tw.set_marquee(
+                    items, self._slide_px, self._fresh_count, self._fresh_at,
+                    self._live_corrections(),
+                )
                 wi += 1
                 continue
 
@@ -1584,10 +1726,12 @@ class SubtitleWindow(QWidget):
         self._gaps.clear()
         self._partial = ""
         self._released_tail = ""
+        self._display_tail = ""
         self._release_queue = ""
         self._release_credit = 0.0
         self._fresh_count = 0
         self._fresh_at = 0.0
+        self._corrections.clear()
         self._live_gap_px = 0.0
         self._frozen_gap = None
         self._last_text_at = 0.0

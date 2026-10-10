@@ -606,8 +606,33 @@ def _subtitle_anchor_and_revision():
     _release_all(win)
     assert win._slide_px == 0.0, f"a one-unit release was parked ({win._slide_px:.0f}px)"
 
+    # A correction must not change the line's width. It is right-anchored, so any
+    # difference shifts everything to the left of the change -- the reader loses
+    # the place they had. A shorter correction is padded out with U+3000, which is
+    # exactly one CJK advance; a longer one cannot be padded and is handed to the
+    # slide residual instead.
+    from PyQt6.QtGui import QFontMetrics
+
+    tw = win._text_widgets[0]
+    line_width = lambda: QFontMetrics(tw._font).horizontalAdvance(
+        "".join(t for t, _ in tw._marquee)
+    )
+    win.clear()
+    win.update_partial("教育价值它是教育应该干什么呢啊")
+    _release_all(win)
+    before = line_width()
+    win.update_partial("教育价值他是教育应该干什么")  # three characters shorter
+    _APP.processEvents()
+    after = line_width()
+    assert abs(after - before) < 0.5, (
+        f"a shorter correction moved the line by {after - before:+.0f}px"
+    )
+
     win.close()
-    return "bottom edge held; revision replaced in place; one-unit release not parked"
+    return (
+        "bottom edge held; revision replaced in place; one-unit release not parked; "
+        f"{before:.0f}px held through a 3-character correction"
+    )
 
 
 def _short_utterance_threshold():
