@@ -243,6 +243,19 @@ def _wizard_skips_cached_models():
     return "cache detected before the network was touched"
 
 
+def _release_all(win, frame=0.016, max_frames=600):
+    """Drive the paced release to completion, as the animation timer would.
+
+    update_partial() only buffers now, so anything asserting on what is on screen
+    has to run the release first.
+    """
+    for _ in range(max_frames):
+        if win._release_step(frame):
+            win._render_marquee()
+        if not win._release_queue:
+            return
+
+
 def _subtitle_lines():
     """Same-language / captions mode must render ONE line, not two identical ones.
 
@@ -327,14 +340,14 @@ def _subtitle_partial_line():
     _APP.processEvents()
 
     win.update_partial("那么第三个标准")
-    _APP.processEvents()
-    assert win._partial == "那么第三个标准", win._partial
+    _release_all(win)
+    assert win._released_tail == "那么第三个标准", win._released_tail
 
     win.update_partial("那么第三个标准的划分叫做根据教育功能")
-    _APP.processEvents()
-    assert win._partial.endswith("教育功能"), win._partial
+    _release_all(win)
+    assert win._released_tail.endswith("教育功能"), win._released_tail
     shown = win._text_widgets[0]._text
-    assert shown.count("那么第三个标准") == 1, f"partial accumulated instead of replacing: {shown}"
+    assert shown.count("那么第三个标准") == 1, f"the tail accumulated instead of replacing: {shown}"
     win._fit_height_snap()
     _APP.processEvents()
     win.grab().save(str(LOGS_DIR / "subtitle-partial.png"))
@@ -426,7 +439,7 @@ def _subtitle_marquee_animation():
     # Arriving text is parked to the right and animated in, not teleported.
     before = win._slide_px
     win.update_partial("第二句话变得更长了一些")
-    _APP.processEvents()
+    _release_all(win)
     parked = win._slide_px
     assert parked > before, "new text was not given an insertion offset"
 
@@ -492,6 +505,55 @@ def _subtitle_no_blank_frames():
     return "no blank frame across 9 partial/commit events; commit adds no lurch"
 
 
+def _subtitle_paced_release():
+    """ASR phrases must go up one unit at a time, and still keep up.
+
+    The recogniser delivers a whole phrase per interval, so it lands as one lump
+    whose size varies and whose start the reader cannot locate without re-scanning
+    the line. Buffering it and releasing one reading unit at a time makes every
+    addition the same size and puts it in the same place; the adaptive rate is
+    what stops the buffer from growing, so the caption stays real-time.
+    """
+    from livetranslate.ui.subtitle_window import (
+        DEFAULT_SUBTITLE_WIN_SETTINGS,
+        SubtitleWindow,
+        split_marquee_units,
+    )
+
+    win = SubtitleWindow(dict(DEFAULT_SUBTITLE_WIN_SETTINGS))
+    win.show()
+    _APP.processEvents()
+
+    frame, interval = 0.016, 0.6
+    releases, settled_depths = [], []
+    phrase = ""
+    for index in range(8):
+        phrase += "那么第三个标准"  # 7 units arrive every interval
+        win.update_partial(phrase)
+        for _ in range(int(interval / frame)):
+            before = len(split_marquee_units(win._released_tail))
+            win._release_step(frame)
+            after = len(split_marquee_units(win._released_tail))
+            if after > before:
+                releases.append(after - before)
+        # Measured at the *end* of an interval: straight after an arrival the
+        # whole increment is queued, which says nothing about whether it keeps up.
+        if index:
+            settled_depths.append(len(split_marquee_units(win._release_queue)))
+
+    assert releases, "nothing was ever released"
+    assert set(releases) == {1}, f"releases were not one unit each: {sorted(set(releases))}"
+    assert max(settled_depths) <= 4, (
+        f"the release fell behind: queue settled at {max(settled_depths)} units"
+    )
+
+    win.close()
+    return (
+        f"all {len(releases)} releases were 1 unit; "
+        f"queue settles at {max(settled_depths)} (7 arrive per interval)"
+    )
+
+
 def main() -> int:
     print(f"project root: {ROOT}\n")
     check("0. boot Qt (offscreen)", _boot)
@@ -507,6 +569,7 @@ def main() -> int:
     check("10. subtitle marquee: one row, trims from the front", _subtitle_marquee)
     check("11. marquee gap freezes; new text slides in", _subtitle_marquee_animation)
     check("12. no blank frame; commit adds no lurch", _subtitle_no_blank_frames)
+    check("13. ASR text released one unit at a time", _subtitle_paced_release)
 
     print("PASSED:")
     for p in PASS:

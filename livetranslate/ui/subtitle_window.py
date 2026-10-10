@@ -9,6 +9,7 @@ Usage:
 """
 
 import ctypes
+import math
 import re
 import time
 from pathlib import Path
@@ -71,10 +72,21 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # Pause width standing in for the silence that followed a sentence.
     "pause_gap_px_per_s": 70.0,
     "pause_gap_max_px": 170.0,
-    # How fast newly arrived text slides in from the right, in px/s. Fast enough
-    # to keep up with speech, slow enough that the eye can follow the line rather
-    # than see it jump.
-    "scroll_speed_px_per_s": 900.0,
+    # How fast the insertion offset settles, in ms. A time constant rather than a
+    # speed, because the offset is always about one reading unit wide -- this way
+    # each step is absorbed smoothly regardless of how large the unit is or how
+    # quickly they arrive.
+    "slide_settle_ms": 90,
+    # Paced release. The recogniser hands over a whole phrase at once; releasing
+    # it one reading unit at a time keeps every addition the same size and in the
+    # same place, so the reader never has to re-scan the line to find the new
+    # part. release_units_per_s is the floor; a long phrase drains over roughly
+    # release_drain_s regardless, which is what keeps the caption real-time.
+    "release_units_per_s": 8.0,
+    "release_drain_s": 0.4,
+    # How long a newly released unit takes to fade in -- the visual cue for
+    # "this is what just appeared".
+    "fresh_fade_in_ms": 220,
     # Minimum time a sentence stays up before it may be replaced, in ms.
     # Applied by delaying the replacement, so a large value makes live captions
     # lag the audio; 0 disables the throttle.
@@ -224,6 +236,12 @@ class _SubtitleTextWidget(QWidget):
         # Insertion offset: newly arrived text is parked this far to the right and
         # animated back to zero, so it slides in instead of teleporting.
         self._marquee_slide_px = 0.0
+        # Trailing units that were just released, and when. They fade in, which is
+        # the cue for "this is the part that is new" -- without it the reader has
+        # to re-scan the whole line to work out where the addition starts.
+        self._fresh_units = 0
+        self._fresh_at = 0.0
+        self._fresh_fade_in_s = 0.22
         self._fade_out_px = 96
 
     # --- pyqtProperty for content opacity ---
@@ -267,6 +285,7 @@ class _SubtitleTextWidget(QWidget):
         self._align = cfg.get("align", "center")
         self._scroll_mode = bool(cfg.get("scroll", False))
         self._fade_out_px = int(cfg.get("fade_out_px", 96))
+        self._fresh_fade_in_s = max(0.0, float(cfg.get("fresh_fade_in_ms", 220)) / 1000.0)
         resolved = _resolve_image_path(cfg.get("bg_image", ""))
         self._bg_pixmap = QPixmap(resolved) if resolved else None
         self._entry_animation = cfg.get("entry_animation", "none")
@@ -464,7 +483,8 @@ class _SubtitleTextWidget(QWidget):
 
         return segments or [text]
 
-    def set_marquee(self, items: list, slide_px: float = 0.0) -> None:
+    def set_marquee(self, items: list, slide_px: float = 0.0,
+                    fresh_units: int = 0, fresh_at: float = 0.0) -> None:
         """Render a single, non-wrapping, right-anchored line.
 
         ``items`` is ``[[text, gap_px_after], ...]``. The gap after a segment is
@@ -472,11 +492,16 @@ class _SubtitleTextWidget(QWidget):
         speaker's silence gets represented, rather than by punctuation the reader
         has no reason to understand.
 
+        ``fresh_units`` trailing reading units fade in from ``fresh_at``, marking
+        what has just been added.
+
         The newest text always ends at the right edge, so new words appear in a
         fixed place and the older words are what moves.
         """
         self._marquee = [[str(t), float(g or 0.0)] for t, g in items]
         self._marquee_slide_px = float(slide_px or 0.0)
+        self._fresh_units = max(0, int(fresh_units))
+        self._fresh_at = float(fresh_at or 0.0)
         # Reset the entry/exit animation state the way set_text() does. A value
         # left over from an unrelated animate_out() would otherwise keep the line
         # faded or offset, since this path does not go through set_text().
@@ -587,17 +612,27 @@ class _SubtitleTextWidget(QWidget):
         # Right-anchored: the end of the line is pinned to the right edge, so the
         # newest words land in a fixed place and the older ones travel left.
         x = float(w - ow - self.marquee_width() + self._marquee_slide_px)
+        all_units = [u for text, _ in self._marquee for u in split_marquee_units(str(text))]
+        fresh_from = max(0, len(all_units) - self._fresh_units)
+        ui = 0
         for text, gap in self._marquee:
             for unit in split_marquee_units(str(text)):
-                self._draw_marquee_unit(painter, fm, unit, snap(x), baseline, outline_pen)
+                fade_in = 1.0
+                if ui >= fresh_from and self._fresh_units and self._fresh_at:
+                    elapsed = time.monotonic() - self._fresh_at
+                    fade_in = min(1.0, elapsed / max(0.01, self._fresh_fade_in_s))
+                self._draw_marquee_unit(
+                    painter, fm, unit, snap(x), baseline, outline_pen, fade_in
+                )
                 x += fm.horizontalAdvance(unit)
+                ui += 1
             x += gap
 
         painter.end()
         self._text_cache = pix
 
-    def _draw_marquee_unit(self, painter, fm, unit, x, baseline, outline_pen):
-        """Draw one reading unit, fading it out as it passes the left edge.
+    def _draw_marquee_unit(self, painter, fm, unit, x, baseline, outline_pen, fade_in=1.0):
+        """Draw one reading unit, fading it in when new and out as it leaves.
 
         The unit -- a CJK character, or a whole Latin word -- is drawn as a
         single path. Per character would break Latin kerning and would let a
@@ -613,6 +648,7 @@ class _SubtitleTextWidget(QWidget):
             alpha = 1.0
         else:
             alpha = max(0.0, 1.0 + x / max(1, self._fade_out_px))
+        alpha *= max(0.0, min(1.0, fade_in))
         if alpha <= 0.0:
             return
 
@@ -747,6 +783,16 @@ class SubtitleWindow(QWidget):
         self._slide_px = 0.0
         self._last_text_width = 0.0
         self._last_tick = 0.0
+        # Paced release. The recogniser hands over a whole phrase at once, which
+        # lands as one lump the reader has to re-scan to find the new part, and
+        # the lump size varies. Text is buffered here and released one reading
+        # unit at a time instead: every addition is then the same size and
+        # appears in the same place, with no re-scanning.
+        self._release_queue = ""   # units recognised but not on screen yet
+        self._released_tail = ""   # the in-progress text actually being shown
+        self._release_credit = 0.0
+        self._fresh_count = 0
+        self._fresh_at = 0.0
         self._marquee_timer = QTimer(self)
         self._marquee_timer.setInterval(16)  # ~60fps
         self._marquee_timer.timeout.connect(self._tick_marquee)
@@ -1111,13 +1157,13 @@ class SubtitleWindow(QWidget):
             # Speech resumed. Fix the pause that preceded it here, or the gap
             # would go on widening while the words are already on screen.
             self._mark_text_arrived()
-        if self._partial:
+        self._queue_partial(text)
+        if text:
             self._restart_auto_hide_timer()
         # Content changed, so re-render through the normal path: that is also
         # where the insertion offset gets compensated.
         self._refresh_display()
-        if self._partial:
-            self._start_marquee()
+        self._start_marquee()
 
     def _on_update_text(self, original: str, translations_json: str):
         translations = json.loads(translations_json)
@@ -1167,6 +1213,13 @@ class SubtitleWindow(QWidget):
         self._live_gap_px = 0.0
         self._frozen_gap = None
         self._last_text_at = time.monotonic()
+        # The committed sentence takes over from the in-progress tail. Put up
+        # anything still buffered first so the committed line is complete, then
+        # hand the tail over to the sentence list.
+        self._flush_release()
+        self._released_tail = ""
+        self._release_queue = ""
+        self._release_credit = 0.0
         # The committed text now covers whatever the partial line was showing.
         self._partial = ""
         self._start_marquee()
@@ -1192,6 +1245,63 @@ class SubtitleWindow(QWidget):
             if cfg.get("enabled", True) and cfg.get("scroll"):
                 return cfg
         return None
+
+    def _queue_partial(self, text: str) -> None:
+        """Buffer the part of the in-progress text that is not on screen yet.
+
+        Partials are *replacements*, not increments ("那么" then "那么第三"), so
+        the increment has to be derived against what has already been shown.
+        """
+        text = text or ""
+        if text.startswith(self._released_tail):
+            self._release_queue = text[len(self._released_tail):]
+        else:
+            # Either the first text, or the recogniser revised the sentence
+            # rather than extending it -- there is no sensible increment to
+            # spread, so put the whole thing up at once.
+            self._released_tail = ""
+            self._release_queue = text
+
+    def _release_step(self, dt: float) -> bool:
+        """Show at most a little more of the buffered text. True if anything moved.
+
+        The rate is a floor plus a catch-up term, so an ordinary partial is
+        released as a smooth trickle and a long one still drains promptly. That
+        is what keeps the caption real-time while the increments stay even.
+        """
+        if not self._release_queue:
+            return False
+        units = split_marquee_units(self._release_queue)
+        if not units:
+            self._release_queue = ""
+            return False
+
+        base = float(self._settings.get("release_units_per_s", 8.0))
+        drain = max(0.15, float(self._settings.get("release_drain_s", 0.4)))
+        rate = max(base, len(units) / drain)
+        self._release_credit += rate * dt
+
+        released = 0
+        while self._release_credit >= 1.0 and self._release_queue:
+            head = split_marquee_units(self._release_queue)[0]
+            self._released_tail += head
+            self._release_queue = self._release_queue[len(head):]
+            self._release_credit -= 1.0
+            released += 1
+        if released:
+            self._fresh_count = released
+            self._fresh_at = time.monotonic()
+        return bool(released)
+
+    def _flush_release(self) -> None:
+        """Show everything buffered at once (used when a sentence commits)."""
+        if not self._release_queue:
+            return
+        self._released_tail += self._release_queue
+        self._fresh_count = len(split_marquee_units(self._release_queue))
+        self._fresh_at = time.monotonic()
+        self._release_queue = ""
+        self._release_credit = 0.0
 
     def _pause_gap_px(self) -> float:
         """Blank width for the silence currently on display.
@@ -1226,19 +1336,28 @@ class SubtitleWindow(QWidget):
         dt = max(0.0, min(0.1, now - self._last_tick))
         self._last_tick = now
 
-        moved = False
+        # Release one reading unit at a time from whatever has been buffered.
+        moved = self._release_step(dt)
+
         if self._slide_px > 0.0:
-            speed = float(self._settings.get("scroll_speed_px_per_s", 900.0))
-            self._slide_px = max(0.0, self._slide_px - speed * dt)
+            # Exponential settle rather than a fixed speed: the offset is always
+            # about one reading unit wide, and a time constant absorbs each step
+            # smoothly no matter how big it is or how fast they arrive.
+            tau = max(0.02, float(self._settings.get("slide_settle_ms", 90)) / 1000.0)
+            self._slide_px *= math.exp(-dt / tau)
+            if self._slide_px < 0.5:
+                self._slide_px = 0.0
             moved = True
-            if self._slide_px == 0.0:
-                # Snap the final frame so the line settles on an exact position.
-                self._render_marquee()
-                return
 
         gap = self._pause_gap_px()
         if abs(gap - self._live_gap_px) >= 0.5:
             self._live_gap_px = gap
+            moved = True
+
+        # Keep ticking while a fade-in is still playing: stopping here would
+        # leave the newest units frozen part-way faded.
+        fade = max(0.0, float(self._settings.get("fresh_fade_in_ms", 220)) / 1000.0)
+        if self._fresh_count and self._fresh_at and (now - self._fresh_at) < fade:
             moved = True
 
         if not moved:
@@ -1264,8 +1383,15 @@ class SubtitleWindow(QWidget):
             tw = self._text_widgets[wi]
             if not (cfg.get("scroll") and tw._scroll_mode):
                 continue
+            if cfg.get("type", "original") == "original":
+                # Every release adds width, and without this the whole line would
+                # jump left by that width on each frame's release.
+                self._compensate_insertion()
             tw.set_marquee(
-                self._marquee_items(cfg.get("type", "original"), cfg), self._slide_px
+                self._marquee_items(cfg.get("type", "original"), cfg),
+                self._slide_px,
+                self._fresh_count,
+                self._fresh_at,
             )
 
     def _compensate_insertion(self) -> None:
@@ -1290,7 +1416,7 @@ class SubtitleWindow(QWidget):
         for original in (s[0] for s in self._sentences):
             for unit in split_marquee_units(original):
                 total += fm.horizontalAdvance(unit)
-        for unit in split_marquee_units(self._partial):
+        for unit in split_marquee_units(self._released_tail):
             total += fm.horizontalAdvance(unit)
         return total
 
@@ -1310,8 +1436,8 @@ class SubtitleWindow(QWidget):
                 # resumes, then stops.
                 gap = self._pause_gap_px()
             items.append([text, gap])
-        if self._partial:
-            items.append([self._partial, 0.0])
+        if self._released_tail:
+            items.append([self._released_tail, 0.0])
         return items
 
     @staticmethod
@@ -1343,7 +1469,7 @@ class SubtitleWindow(QWidget):
         fm = QFontMetrics(tw._font)
         for _ in range(200):  # bounded: each pass drops at least one character
             total = sum(fm.horizontalAdvance(s[0]) for s in self._sentences)
-            total += sum(self._gaps) + fm.horizontalAdvance(self._partial)
+            total += sum(self._gaps) + fm.horizontalAdvance(self._released_tail)
             if total <= limit or not self._sentences:
                 return
             head = self._sentences[0][0]
@@ -1362,7 +1488,7 @@ class SubtitleWindow(QWidget):
         # The in-progress line counts as content: at the start of an utterance
         # there are no committed sentences yet, and that is exactly when the
         # caption most needs to be on screen.
-        if not self._sentences and not self._partial:
+        if not self._sentences and not self._released_tail and not self._release_queue:
             for tw in self._text_widgets:
                 tw.set_text("")
             self._fit_height_snap()
@@ -1383,7 +1509,7 @@ class SubtitleWindow(QWidget):
                     self._trim_marquee(tw)
                     items = self._marquee_items(line_type, cfg)
                     self._compensate_insertion()
-                tw.set_marquee(items, self._slide_px)
+                tw.set_marquee(items, self._slide_px, self._fresh_count, self._fresh_at)
                 wi += 1
                 continue
 
@@ -1428,6 +1554,11 @@ class SubtitleWindow(QWidget):
         self._sentences.clear()
         self._gaps.clear()
         self._partial = ""
+        self._released_tail = ""
+        self._release_queue = ""
+        self._release_credit = 0.0
+        self._fresh_count = 0
+        self._fresh_at = 0.0
         self._live_gap_px = 0.0
         self._frozen_gap = None
         self._last_text_at = 0.0
