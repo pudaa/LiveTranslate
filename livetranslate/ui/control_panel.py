@@ -38,7 +38,10 @@ from livetranslate.ui.dialogs import (
 )
 from livetranslate.models.manager import (
     DEFAULT_FUNASR_MODEL,
+    DEFAULT_SHERPA_MODEL,
+    DEFAULT_SHERPA_PUNCT_MODEL,
     MODELS_DIR,
+    SHERPA_MODEL_PROFILES,
     _WHISPER_SIZES,
     dir_size,
     funasr_model_options,
@@ -50,6 +53,7 @@ from livetranslate.models.manager import (
     normalize_funasr_model_key,
     resolve_custom_whisper_model,
 )
+from livetranslate.asr import registry
 from livetranslate.paths import SETTINGS_FILE, TRANSCRIPTS_DIR
 from livetranslate.ui.i18n import t, LANGUAGES
 from livetranslate.ui.styles import CINEMA_OVERLAY_ITEMS
@@ -68,6 +72,24 @@ def _load_saved_settings() -> dict | None:
     except Exception as e:
         log.warning(f"Failed to load settings: {e}")
     return None
+
+
+def _merge_settings(base: dict, overlay: dict) -> dict:
+    """Merge ``overlay`` into ``base``, recursing one level into nested dicts.
+
+    One level is what the shape calls for: sections such as ``style`` and
+    ``subtitle_mode`` are flat dicts of scalars, while genuinely list-shaped
+    values (``models``, ``subtitle_mode.lines``) are replaced wholesale on
+    purpose -- a user-edited list should not be merged element-wise with a
+    default.
+    """
+    for key, value in overlay.items():
+        current = base.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            current.update(value)
+        else:
+            base[key] = value
+    return base
 
 
 def _save_settings(settings: dict):
@@ -93,6 +115,69 @@ class ControlPanel(QWidget):
     _cache_result = pyqtSignal(list)
     reset_positions = pyqtSignal()
 
+    @staticmethod
+    def _default_settings(config) -> dict:
+        """Every settings key, independent of any saved file.
+
+        Kept in one place because a saved settings file is a *partial overlay*:
+        the setup wizard writes only the keys it decides, and an older release's
+        file can predate whole sections. The caller merges the saved file onto
+        this baseline, so an incomplete file degrades to the defaults here rather
+        than to whatever each widget happens to fall back on.
+        """
+        from livetranslate.ui.overlay import DEFAULT_STYLE
+        from livetranslate.ui.subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS
+
+        tc = config["translation"]
+        asr = config["asr"]
+        return {
+            "vad_mode": "silero",
+            "vad_threshold": asr["vad_threshold"],
+            "energy_threshold": 0.02,
+            "min_speech_duration": asr["min_speech_duration"],
+            "max_speech_duration": asr["max_speech_duration"],
+            "silence_mode": "auto",
+            "silence_duration": 0.8,
+            "asr_language": asr.get("language", "auto"),
+            "asr_engine": asr.get("asr_engine", registry.DEFAULT_BACKEND),
+            "funasr_model": asr.get("funasr_model", DEFAULT_FUNASR_MODEL),
+            "sherpa_model": asr.get("sherpa_model", DEFAULT_SHERPA_MODEL),
+            "sherpa_threads": asr.get("sherpa_threads", 4),
+            "sherpa_punctuation": asr.get("sherpa_punctuation", True),
+            "asr_device": asr.get("device", "cpu"),
+            "sensevoice_pad_seconds": asr.get("sensevoice_pad_seconds", 0.5),
+            "whisper_pad_seconds": asr.get("whisper_pad_seconds", 0.5),
+            "whisper_model_size": asr.get("model_size", "medium"),
+            "remote_asr_url": asr.get("remote_asr_url", "http://127.0.0.1:8765"),
+            "target_language": tc.get("target_language", "zh"),
+            "models": [
+                {
+                    "name": f"{tc['model']}",
+                    "api_base": tc["api_base"],
+                    "api_key": tc["api_key"],
+                    "model": tc["model"],
+                }
+            ],
+            "active_model": 0,
+            "hub": "ms",
+            "download_proxy": "system",
+            "audio_device": None,
+            "mic_device": None,
+            "audio_target_process": "",
+            "overlay_x": None,
+            "overlay_y": None,
+            "overlay_w": None,
+            "overlay_h": None,
+            # The overlay palette and the whole subtitle-window config. Neither
+            # used to be here, so a settings file without them meant "whatever
+            # the widget falls back to" -- a black overlay, and because
+            # DEFAULT_SUBTITLE_WIN_SETTINGS.enabled was False, no captions at
+            # all. For a fork whose entire point is captions, that default is
+            # wrong; it is flipped to True in subtitle_window.py.
+            "style": dict(DEFAULT_STYLE),
+            "subtitle_mode": dict(DEFAULT_SUBTITLE_WIN_SETTINGS),
+        }
+
     def __init__(self, config, saved_settings=None):
         super().__init__()
         self._config = config
@@ -101,41 +186,15 @@ class ControlPanel(QWidget):
         self.resize(520, min(650, available_screen_height(self)))
 
         saved = migrate_funasr_settings(saved_settings) or _load_saved_settings()
+        # Overlay `saved` on top of the full defaults rather than replacing them.
+        # A settings file can legitimately be partial: the setup wizard writes
+        # only the handful of keys it decides, and an older release's file may
+        # lack whole sections. Replacing wholesale left everything else
+        # undefined -- which is how a packaged build ended up with a black
+        # overlay and no subtitle window at all.
+        self._current_settings = self._default_settings(config)
         if saved:
-            self._current_settings = saved
-        else:
-            tc = config["translation"]
-            self._current_settings = {
-                "vad_mode": "silero",
-                "vad_threshold": config["asr"]["vad_threshold"],
-                "energy_threshold": 0.02,
-                "min_speech_duration": config["asr"]["min_speech_duration"],
-                "max_speech_duration": config["asr"]["max_speech_duration"],
-                "silence_mode": "auto",
-                "silence_duration": 0.8,
-                "asr_language": config["asr"].get("language", "auto"),
-                "asr_engine": "funasr",
-                "funasr_model": config["asr"].get(
-                    "funasr_model", DEFAULT_FUNASR_MODEL
-                ),
-                "asr_device": "cuda",
-                "sensevoice_pad_seconds": config["asr"].get(
-                    "sensevoice_pad_seconds", 0.5
-                ),
-                "whisper_pad_seconds": config["asr"].get(
-                    "whisper_pad_seconds", 0.5
-                ),
-                "models": [
-                    {
-                        "name": f"{tc['model']}",
-                        "api_base": tc["api_base"],
-                        "api_key": tc["api_key"],
-                        "model": tc["model"],
-                    }
-                ],
-                "active_model": 0,
-                "hub": "ms",
-            }
+            _merge_settings(self._current_settings, saved)
 
         if "models" not in self._current_settings:
             tc = config["translation"]
@@ -211,23 +270,35 @@ class ControlPanel(QWidget):
         asr_layout.setColumnStretch(0, 1)
         asr_layout.setColumnMinimumWidth(1, 180)
 
+        # Offer only engines whose runtime is installed: a CPU-only build has no
+        # torch, and listing FunASR/Whisper there would only produce a failed
+        # load. registry.available_backends() probes dependencies without
+        # importing them. "remote-whisper" is always offered -- it talks HTTP to
+        # another machine and needs no local runtime.
+        available_engines = set(registry.available_backends())
+
         self._asr_engine = QComboBox()
         self._asr_engine.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self._asr_engine.addItems(
-            [
-                f"[{t('asr_accurate')}] Whisper (faster-whisper)",
-                f"[{t('asr_fast')}] FunASR",
-                "Anime-Whisper (ja, anime/galgame)",
-                "Remote Whisper (remote GPU server)",
-            ]
+        # Items are added in this order and `self._engine_keys` mirrors it.
+        # Visibility and persistence key off the engine *key*, never the row
+        # index, so adding an engine cannot silently shift the others.
+        self._engine_keys: list[str] = []
+        for engine_key, engine_label in (
+            ("sherpa-onnx", f"[{t('asr_fast')}] sherpa-onnx (CPU)"),
+            ("funasr", f"[{t('asr_fast')}] FunASR"),
+            ("whisper", f"[{t('asr_accurate')}] Whisper (faster-whisper)"),
+            ("anime-whisper", "Anime-Whisper (ja, anime/galgame)"),
+            ("remote-whisper", "Remote Whisper (remote GPU server)"),
+        ):
+            if engine_key == "remote-whisper" or engine_key in available_engines:
+                self._engine_keys.append(engine_key)
+                self._asr_engine.addItem(engine_label)
+        saved_engine = s.get("asr_engine") or registry.DEFAULT_BACKEND
+        engine_idx = (
+            self._engine_keys.index(saved_engine)
+            if saved_engine in self._engine_keys
+            else 0
         )
-        engine_map_idx = {
-            "whisper": 0,
-            "funasr": 1,
-            "anime-whisper": 2,
-            "remote-whisper": 3,
-        }
-        engine_idx = engine_map_idx.get(s.get("asr_engine"), 0)
         self._asr_engine.setCurrentIndex(engine_idx)
         asr_layout.addWidget(QLabel(t("label_engine")), 0, 0)
         asr_layout.addWidget(self._asr_engine, 0, 1)
@@ -246,19 +317,21 @@ class ControlPanel(QWidget):
         self._asr_lang.currentIndexChanged.connect(self._auto_save)
 
         self._asr_device = QComboBox()
-        devices = ["cuda", "cpu"]
+        # CUDA is offered only when torch is present AND reports a device. A
+        # CPU-only build has no torch at all, so the list is just "cpu". The row
+        # stays visible rather than being hidden -- a missing row is more
+        # confusing than a disabled option, and sherpa-onnx ignores this value
+        # entirely (it is CPU-only by design).
+        devices = ["cpu"]
         try:
             import torch
 
             for i in range(torch.cuda.device_count()):
-                name = torch.cuda.get_device_name(i)
-                devices.insert(i, f"cuda:{i} ({name})")
-            if torch.cuda.device_count() > 0:
-                devices = [d for d in devices if d != "cuda"]
+                devices.insert(i, f"cuda:{i} ({torch.cuda.get_device_name(i)})")
         except Exception:
             pass
         self._asr_device.addItems(devices)
-        saved_dev = s.get("asr_device", self._config["asr"].get("device", "cuda"))
+        saved_dev = s.get("asr_device", self._config["asr"].get("device", "cpu"))
         for i in range(self._asr_device.count()):
             if self._asr_device.itemText(i).startswith(saved_dev):
                 self._asr_device.setCurrentIndex(i)
@@ -316,6 +389,46 @@ class ControlPanel(QWidget):
         asr_layout.addWidget(self._sensevoice_pad_label, 5, 0)
         asr_layout.addWidget(self._sensevoice_pad_seconds, 5, 1)
         self._sensevoice_pad_seconds.valueChanged.connect(self._auto_save)
+
+        # ── sherpa-onnx controls ──
+        # Rows 10-12: appended after the existing grid rows so none of them
+        # shift. They are hidden unless the sherpa engine is selected (see
+        # _on_engine_changed_whisper_vis), so they cost no space in the common
+        # case.
+        self._sherpa_model_label = QLabel(t("label_sherpa_model"))
+        self._sherpa_model_combo = QComboBox()
+        for sherpa_key, sherpa_entry in SHERPA_MODEL_PROFILES.items():
+            # The punctuation model is a companion, not a choice: it is
+            # switched on/off by the checkbox below, not selected here.
+            if sherpa_key == DEFAULT_SHERPA_PUNCT_MODEL:
+                continue
+            self._sherpa_model_combo.addItem(sherpa_entry["display_name"], sherpa_key)
+        saved_sherpa = s.get("sherpa_model", DEFAULT_SHERPA_MODEL)
+        sherpa_idx = self._sherpa_model_combo.findData(saved_sherpa)
+        if sherpa_idx >= 0:
+            self._sherpa_model_combo.setCurrentIndex(sherpa_idx)
+        self._sherpa_model_combo.currentIndexChanged.connect(self._auto_save)
+        asr_layout.addWidget(self._sherpa_model_label, 10, 0)
+        asr_layout.addWidget(self._sherpa_model_combo, 10, 1)
+
+        self._sherpa_threads_label = QLabel(t("label_sherpa_threads"))
+        self._sherpa_threads_spin = QSpinBox()
+        self._sherpa_threads_spin.setRange(1, 16)
+        try:
+            sherpa_threads = int(s.get("sherpa_threads", 4))
+        except (TypeError, ValueError):
+            sherpa_threads = 4
+        self._sherpa_threads_spin.setValue(sherpa_threads)
+        self._sherpa_threads_spin.setToolTip(t("tip_sherpa_threads"))
+        self._sherpa_threads_spin.valueChanged.connect(self._auto_save)
+        asr_layout.addWidget(self._sherpa_threads_label, 11, 0)
+        asr_layout.addWidget(self._sherpa_threads_spin, 11, 1)
+
+        self._sherpa_punct_cb = QCheckBox(t("label_sherpa_punctuation"))
+        self._sherpa_punct_cb.setChecked(bool(s.get("sherpa_punctuation", True)))
+        self._sherpa_punct_cb.setToolTip(t("tip_sherpa_punctuation"))
+        self._sherpa_punct_cb.toggled.connect(self._auto_save)
+        asr_layout.addWidget(self._sherpa_punct_cb, 12, 0, 1, 2)
 
         self._audio_device = QComboBox()
         self._audio_device.addItem(t("audio_disabled"))
@@ -550,8 +663,11 @@ class ControlPanel(QWidget):
         timing_layout.addWidget(QLabel(t("label_silence_dur")), 3, 0)
         timing_layout.addWidget(self._silence_duration, 3, 1)
 
-        from PyQt6.QtWidgets import QCheckBox
-
+        # QCheckBox comes from the module-level PyQt6 import. Do NOT add a
+        # local `from PyQt6.QtWidgets import QCheckBox` in this method: a local
+        # import anywhere inside a function makes the name local for the
+        # *whole* function, so the sherpa punctuation checkbox built earlier in
+        # _create_vad_tab would raise UnboundLocalError.
         self._incremental_asr_cb = QCheckBox(t("label_incremental_asr"))
         self._incremental_asr_cb.setToolTip(t("incremental_asr_tooltip"))
         self._incremental_asr_cb.setChecked(s.get("incremental_asr", True))
@@ -1290,14 +1406,27 @@ class ControlPanel(QWidget):
         """Get the language code from the ASR language combo (stored as userData)."""
         return self._asr_lang.currentData() or "auto"
 
-    def _on_engine_changed_whisper_vis(self, index):
-        self._whisper_group.setVisible(index == 0)
-        is_funasr = index == 1
+    def _current_engine_key(self) -> str:
+        """Engine key for the selected row, via _engine_keys (never the index)."""
+        idx = self._asr_engine.currentIndex()
+        if 0 <= idx < len(self._engine_keys):
+            return self._engine_keys[idx]
+        return registry.DEFAULT_BACKEND
+
+    def _on_engine_changed_whisper_vis(self, index=None):
+        # Keyed off the engine *key*, not the row index. Rows are built from
+        # whichever engines this build can load, so a hardcoded index would
+        # point at the wrong engine as soon as that list changes.
+        key = self._current_engine_key()
+        is_whisper = key == "whisper"
+        is_funasr = key == "funasr"
+        is_sherpa = key == "sherpa-onnx"
+
+        self._whisper_group.setVisible(is_whisper)
         if hasattr(self, "_funasr_model_combo"):
             self._funasr_model_label.setVisible(is_funasr)
             self._funasr_model_combo.setVisible(is_funasr)
         if hasattr(self, "_whisper_pad_seconds"):
-            is_whisper = index == 0
             self._whisper_pad_label.setVisible(is_whisper)
             self._whisper_pad_seconds.setVisible(is_whisper)
         if hasattr(self, "_sensevoice_pad_seconds"):
@@ -1306,8 +1435,17 @@ class ControlPanel(QWidget):
             )
             self._sensevoice_pad_label.setVisible(show_funasr_pad)
             self._sensevoice_pad_seconds.setVisible(show_funasr_pad)
+        if hasattr(self, "_sherpa_model_combo"):
+            for widget in (
+                self._sherpa_model_label,
+                self._sherpa_model_combo,
+                self._sherpa_threads_label,
+                self._sherpa_threads_spin,
+                self._sherpa_punct_cb,
+            ):
+                widget.setVisible(is_sherpa)
         if hasattr(self, "_remote_group"):
-            self._remote_group.setVisible(index == 3)
+            self._remote_group.setVisible(key == "remote-whisper")
         # Resize window to fit content after whisper group visibility change
         QTimer.singleShot(0, self._fit_height)
 
@@ -1616,16 +1754,18 @@ class ControlPanel(QWidget):
 
     def _apply_settings(self):
         self._current_settings["asr_language"] = self._get_asr_lang_code()
-        engine_map = {
-            0: "whisper",
-            1: "funasr",
-            2: "anime-whisper",
-            3: "remote-whisper",
-        }
-        self._current_settings["asr_engine"] = engine_map.get(
-            self._asr_engine.currentIndex(), "whisper"
-        )
+        self._current_settings["asr_engine"] = self._current_engine_key()
         self._current_settings["funasr_model"] = self._selected_funasr_model()
+        if hasattr(self, "_sherpa_model_combo"):
+            sherpa_value = self._sherpa_model_combo.currentData()
+            if sherpa_value:
+                self._current_settings["sherpa_model"] = str(sherpa_value)
+            self._current_settings["sherpa_threads"] = int(
+                self._sherpa_threads_spin.value()
+            )
+            self._current_settings["sherpa_punctuation"] = bool(
+                self._sherpa_punct_cb.isChecked()
+            )
         if hasattr(self, "_remote_url_edit"):
             url = self._remote_url_edit.text().strip()
             if url:

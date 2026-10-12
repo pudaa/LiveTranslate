@@ -328,6 +328,8 @@ class SubtitleSettingsWidget(QWidget):
         self._settings = {**DEFAULT_SUBTITLE_WIN_SETTINGS, **(settings or {})}
         self._spacing_spin.setValue(self._settings.get("line_spacing", 8))
         self._min_display_spin.setValue(self._settings.get("min_display_ms", 1500))
+        self._stale_hold_spin.setValue(self._settings.get("stale_hold_ms", 2000))
+        self._stale_fade_spin.setValue(self._settings.get("stale_fade_ms", 900))
         self._width_spin.setValue(self._settings.get("window_width", 860))
         self._scale_spin.setValue(int(round(self._settings.get("size_scale", 1.0) * 100)))
         self._bg_color_btn.set_color(self._settings.get("bg_color", "#000000"))
@@ -415,6 +417,33 @@ class SubtitleSettingsWidget(QWidget):
         self._min_display_spin.setValue(self._settings.get("min_display_ms", 1500))
         self._min_display_spin.valueChanged.connect(self._on_change)
         g.addWidget(self._min_display_spin, r, 1)
+        r += 1
+
+        # How long a finished line stays on screen before it starts to fade.
+        # Distinct from min_display_ms above (a floor on how quickly a line may
+        # be replaced) and from auto_hide_timeout below (which hides the whole
+        # window). Resets every time new text arrives, so under continuous
+        # speech it never engages.
+        g.addWidget(QLabel(t("subwin_stale_hold")), r, 0)
+        self._stale_hold_spin = QSpinBox()
+        self._stale_hold_spin.setRange(0, 15000)
+        self._stale_hold_spin.setSingleStep(100)
+        self._stale_hold_spin.setSuffix(" ms")
+        self._stale_hold_spin.setToolTip(t("subwin_stale_hold_tip"))
+        self._stale_hold_spin.setValue(self._settings.get("stale_hold_ms", 2000))
+        self._stale_hold_spin.valueChanged.connect(self._on_change)
+        g.addWidget(self._stale_hold_spin, r, 1)
+        r += 1
+
+        g.addWidget(QLabel(t("subwin_stale_fade")), r, 0)
+        self._stale_fade_spin = QSpinBox()
+        self._stale_fade_spin.setRange(50, 5000)
+        self._stale_fade_spin.setSingleStep(50)
+        self._stale_fade_spin.setSuffix(" ms")
+        self._stale_fade_spin.setToolTip(t("subwin_stale_fade_tip"))
+        self._stale_fade_spin.setValue(self._settings.get("stale_fade_ms", 900))
+        self._stale_fade_spin.valueChanged.connect(self._on_change)
+        g.addWidget(self._stale_fade_spin, r, 1)
         r += 1
 
         self._bg_color_label = QLabel(t("subwin_bg_color"))
@@ -665,6 +694,8 @@ class SubtitleSettingsWidget(QWidget):
         s = {
             "line_spacing": self._spacing_spin.value(),
             "min_display_ms": self._min_display_spin.value(),
+            "stale_hold_ms": self._stale_hold_spin.value(),
+            "stale_fade_ms": self._stale_fade_spin.value(),
             "window_width": self._width_spin.value(),
             "size_scale": self._scale_spin.value() / 100.0,
             "bg_color": self._bg_color_btn.color(),

@@ -33,14 +33,33 @@ audio:
   chunk_duration: 0.032
 
 asr:
-  # ASR engine: whisper, funasr, anime-whisper
-  asr_engine: "funasr"
+  # ASR engine: sherpa-onnx (default), funasr, whisper, anime-whisper.
+  #
+  # sherpa-onnx is the default because it is the only engine with no torch
+  # dependency: it runs SenseVoice as int8 ONNX on the CPU (~215ms for an 8s
+  # segment, against the 600ms interim budget) and leaves the dGPU asleep at
+  # P8/~2.7W instead of pinning it at P0/~21W. The torch-based engines remain
+  # selectable when their runtime is installed -- pick one to use the GPU.
+  asr_engine: "sherpa-onnx"
   # Model size: tiny, base, small, medium, large-v3
   model_size: "medium"
   # FunASR model: sensevoice-small, funasr-nano-2512, funasr-mlt-nano-2512
   funasr_model: "sensevoice-small"
-  # Device: cuda or cpu
-  device: "cuda"
+  # sherpa-onnx model key -- see SHERPA_MODEL_PROFILES in
+  # livetranslate/models/manager.py. The models ship with the release under
+  # ./models/; nothing is downloaded at run time.
+  sherpa_model: "sensevoice-int8"
+  # CPU threads for sherpa-onnx. Measured on the dev machine: 4 threads gave
+  # 214ms per 8s segment, 8 threads 165ms, 2 threads 296ms. More threads finish
+  # sooner but raise the CPU package power, so 4 is the balance point.
+  sherpa_threads: 4
+  # Restore punctuation using the CT-Transformer model (~75MB, ~15ms per
+  # segment). sherpa's SenseVoice decode drops punctuation entirely -- the
+  # vocab has it, but greedy int8 decoding loses it -- and the subtitle is
+  # noticeably harder to read without it.
+  sherpa_punctuation: true
+  # Device: cuda or cpu. Ignored by sherpa-onnx, which is CPU-only by design.
+  device: "cpu"
   # Compute type: float16, int8_float16, int8
   compute_type: "float16"
   # Language: auto, en, ja, zh, ko, etc.

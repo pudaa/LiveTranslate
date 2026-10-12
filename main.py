@@ -18,6 +18,7 @@ from datetime import datetime
 
 from livetranslate.models.manager import (
     DEFAULT_FUNASR_MODEL,
+    DEFAULT_SHERPA_MODEL,
     apply_cache_env,
     funasr_display_name,
     funasr_supports_padding,
@@ -30,6 +31,7 @@ from livetranslate.models.manager import (
     normalize_asr_engine_selection,
     normalize_funasr_model_key,
     resolve_custom_whisper_model,
+    sherpa_profile,
 )
 
 from livetranslate.paths import (
@@ -46,12 +48,19 @@ import os
 
 log = logging.getLogger("LiveTranslate")
 
-# torch must be imported before PyQt6 to avoid DLL conflicts on Windows
-import torch  # noqa: F401
+# torch must be imported before PyQt6 to avoid DLL conflicts on Windows -- but
+# only when it is installed at all. A CPU-only build ships without torch
+# (sherpa-onnx + onnxruntime do all the inference), and nothing below actually
+# requires it: the torch.cuda calls further down are optional memory reporting.
+try:
+    import torch  # noqa: F401
+except ImportError:
+    torch = None
 
 from livetranslate.audio.capture import AudioCapture
 from livetranslate.audio.vad import VADProcessor
 from livetranslate.asr.client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
+from livetranslate.asr.registry import DEFAULT_BACKEND
 from livetranslate.translate.translator import Translator, RepetitionError
 from livetranslate.translate.modes import CAPTIONS, normalize as normalize_pipeline_mode
 from livetranslate.output.transcript import TranscriptWriter
@@ -554,6 +563,24 @@ class LiveTranslateApp:
             engine_type, settings.get("funasr_model", self._funasr_model_key)
         )
         device = settings.get("asr_device", self._asr_device)
+        # sherpa-onnx knobs. Threads and punctuation are part of the engine
+        # identity (see signature_model below): both change how audio decodes,
+        # so editing either has to reload the worker rather than be ignored.
+        sherpa_model = settings.get(
+            "sherpa_model",
+            self._config["asr"].get("sherpa_model", DEFAULT_SHERPA_MODEL),
+        )
+        sherpa_threads = int(
+            settings.get(
+                "sherpa_threads", self._config["asr"].get("sherpa_threads", 4)
+            )
+        )
+        sherpa_punctuation = bool(
+            settings.get(
+                "sherpa_punctuation",
+                self._config["asr"].get("sherpa_punctuation", True),
+            )
+        )
         hub = "ms"
         download_proxy = "system"
         if self._panel:
@@ -571,6 +598,8 @@ class LiveTranslateApp:
                 cache_model_key = model_path
         elif engine_type == "funasr":
             cache_model_key = funasr_model
+        elif engine_type == "sherpa-onnx":
+            cache_model_key = sherpa_model
 
         remote_asr_url = settings.get(
             "remote_asr_url",
@@ -582,6 +611,13 @@ class LiveTranslateApp:
             signature_model = cache_model_key
         elif engine_type == "funasr":
             signature_model = funasr_model
+        elif engine_type == "sherpa-onnx":
+            # Threads and punctuation change the decoded text, so they belong in
+            # the engine identity -- otherwise editing them would be silently
+            # ignored until the next restart.
+            signature_model = (
+                f"{sherpa_model}:t{sherpa_threads}:pn{int(sherpa_punctuation)}"
+            )
         elif engine_type == "remote-whisper":
             # URL is part of the identity so editing it triggers a reconnect.
             signature_model = remote_asr_url
@@ -623,6 +659,8 @@ class LiveTranslateApp:
             display_name = f"Whisper {display_model}"
         elif engine_type == "funasr":
             display_name = funasr_display_name(funasr_model)
+        elif engine_type == "sherpa-onnx":
+            display_name = sherpa_profile(sherpa_model)["display_name"]
 
         parent = (
             self._panel if self._panel and self._panel.isVisible() else self._overlay
@@ -631,6 +669,9 @@ class LiveTranslateApp:
         worker_config = {
             "engine_type": engine_type,
             "funasr_model": funasr_model,
+            "sherpa_model": sherpa_model,
+            "sherpa_threads": sherpa_threads,
+            "sherpa_punctuation": sherpa_punctuation,
             "model_size": cache_model_key,
             "device": device,
             "compute_type": compute,
@@ -847,7 +888,7 @@ class LiveTranslateApp:
         gpu_alloc_mb = 0.0
         gpu_reserved_mb = 0.0
         try:
-            if torch.cuda.is_available():
+            if torch is not None and torch.cuda.is_available():
                 gpu_alloc_mb = torch.cuda.memory_allocated() / 1024 / 1024
                 gpu_reserved_mb = torch.cuda.memory_reserved() / 1024 / 1024
         except Exception:
@@ -883,7 +924,7 @@ class LiveTranslateApp:
     def _release_memory_caches(self):
         gc.collect()
         try:
-            if torch.cuda.is_available():
+            if torch is not None and torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
             pass
@@ -1371,11 +1412,21 @@ class LiveTranslateApp:
 
     _segmenter_cache = {}  # lang -> yasbd pysbd_adapter.Segmenter
 
+    # Sentence segmenters yasbd does not ship under their own code. Falling
+    # back to "en" for these would run a *Latin* splitter over CJK text, which
+    # finds no terminators and gives up -- the caller then loses sentence
+    # splitting altogether and falls back to comma-splitting at 60 chars.
+    # Cantonese is written with Mandarin punctuation, so "zh" is correct.
+    _SEGMENTER_LANG_ALIASES = {"yue": "zh", "zh-yue": "zh", "zh-hant": "zh"}
+
     @staticmethod
     def _get_segmenter(lang: str):
         from yasbd import get_supported_langs, pysbd_adapter
         if lang not in LiveTranslateApp._segmenter_cache:
-            seg_lang = lang if lang in get_supported_langs() else "en"
+            supported = get_supported_langs()
+            seg_lang = LiveTranslateApp._SEGMENTER_LANG_ALIASES.get(lang, lang)
+            if seg_lang not in supported:
+                seg_lang = "en"
             LiveTranslateApp._segmenter_cache[lang] = pysbd_adapter.Segmenter(
                 language=seg_lang, clean=False
             )
@@ -2033,17 +2084,38 @@ def main():
     # Non-first launch but models missing → download dialog
     else:
         saved = saved or {}
-        current_engine = saved.get("asr_engine", config["asr"].get("asr_engine", "funasr"))
-        missing = get_missing_models(
-            current_engine,
-            (
-                saved.get("funasr_model", config["asr"].get("funasr_model"))
-                if current_engine == "funasr"
-                else saved.get("whisper_model_size", config["asr"]["model_size"])
-            ),
-            saved.get("hub", "ms"),
+        current_engine = saved.get(
+            "asr_engine", config["asr"].get("asr_engine", DEFAULT_BACKEND)
         )
-        if missing:
+        if current_engine == "funasr":
+            current_model = saved.get(
+                "funasr_model", config["asr"].get("funasr_model")
+            )
+        elif current_engine == "sherpa-onnx":
+            current_model = saved.get(
+                "sherpa_model",
+                config["asr"].get("sherpa_model", DEFAULT_SHERPA_MODEL),
+            )
+        else:
+            current_model = saved.get(
+                "whisper_model_size", config["asr"]["model_size"]
+            )
+
+        missing = get_missing_models(
+            current_engine, current_model, saved.get("hub", "ms")
+        )
+        if current_engine == "sherpa-onnx":
+            # These models ship inside the release and are never fetched over the
+            # network, so a download dialog cannot help -- it would only offer a
+            # button that fails. Report it and carry on; the engine itself will
+            # refuse to load with a precise message.
+            if missing:
+                log.error(
+                    "sherpa-onnx models are missing from models/: "
+                    f"{[m['name'] for m in missing]}. They ship with the "
+                    "release -- re-extract the package."
+                )
+        elif missing:
             log.info(f"Missing models: {[m['name'] for m in missing]}")
             dlg = ModelDownloadDialog(
                 missing,
@@ -2076,10 +2148,13 @@ def main():
             overlay.resize(ow, oh)
     overlay.show()
 
-    # Subtitle window
-    subwin_cfg = (saved or {}).get("subtitle_mode")
+    # Subtitle window. Read from the panel's *merged* settings, not the raw saved
+    # file: a settings file written by the setup wizard carries only a handful of
+    # keys, and taking it literally here meant subwin_cfg was None and the window
+    # stayed off -- no captions on a fresh install.
+    subwin_cfg = panel.get_settings().get("subtitle_mode") or {}
     subwin = SubtitleWindow(subwin_cfg)
-    subwin_was_enabled = (subwin_cfg or {}).get("enabled", False)
+    subwin_was_enabled = bool(subwin_cfg.get("enabled", False))
 
     live_trans = LiveTranslateApp(config)
     live_trans.set_overlay(overlay)
@@ -2553,8 +2628,87 @@ def main():
     sys.exit(app.exec())
 
 
+def _run_selftest() -> int:
+    """Headless check that this build can actually load its ASR engine.
+
+    A build once shipped where everything *started* fine but the backend module
+    was absent from the archive -- the registry resolves engines by string
+    (``importlib.import_module``), so PyInstaller's dependency walk could not see
+    it, and the app only failed once a user tried to load a model. "It starts"
+    is not a sufficient release check.
+
+    A one-file exe is windowed, so the report goes to ``logs/selftest.log`` as
+    well as stdout, and the exit code carries the verdict.
+    """
+    import io
+    import traceback
+
+    report = io.StringIO()
+
+    def say(line: str) -> None:
+        print(line)
+        report.write(line + "\n")
+
+    ok = True
+    try:
+        from livetranslate.asr import registry
+        from livetranslate.asr.client import ASRClient
+        from livetranslate.models.manager import (
+            DEFAULT_SHERPA_MODEL,
+            is_silero_cached,
+        )
+
+        say(f"torch installed    : {torch is not None}")
+        say(f"available backends : {registry.available_backends()}")
+        say(f"default backend    : {registry.DEFAULT_BACKEND}")
+        say(f"silero VAD on disk : {is_silero_cached()}")
+
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            asr = (yaml.safe_load(fh) or {}).get("asr", {}) or {}
+        engine = asr.get("asr_engine", registry.DEFAULT_BACKEND)
+        worker_config = {
+            "engine_type": engine,
+            "sherpa_model": asr.get("sherpa_model", DEFAULT_SHERPA_MODEL),
+            "sherpa_threads": asr.get("sherpa_threads", 4),
+            "sherpa_punctuation": asr.get("sherpa_punctuation", True),
+            "funasr_model": asr.get("funasr_model", "sensevoice-small"),
+            "model_size": asr.get("model_size", "medium"),
+            "device": asr.get("device", "cpu"),
+            "hub": "ms",
+            "compute_type": asr.get("compute_type", "float16"),
+            "language": asr.get("language", "auto"),
+            "pad_seconds": asr.get("sensevoice_pad_seconds", 0.5),
+            "display_name": "selftest",
+        }
+        say(f"engine to load     : {engine}")
+
+        client = ASRClient(worker_config, ready_timeout=180.0, request_timeout=60.0)
+        try:
+            client.start()
+            say(f"worker ready       : {client.wait_ready()}")
+            silence = np.zeros(16000, dtype=np.float32)
+            say(f"transcribe(silence): {client.transcribe(silence)!r}")
+        finally:
+            client.shutdown()
+        say("RESULT             : OK")
+    except Exception as exc:
+        ok = False
+        say(f"RESULT             : FAILED -- {type(exc).__name__}: {exc}")
+        for line in traceback.format_exc().splitlines():
+            say(f"  {line}")
+
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        (LOGS_DIR / "selftest.log").write_text(report.getvalue(), encoding="utf-8")
+    except Exception:
+        pass
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
     import multiprocessing as _multiprocessing
 
     _multiprocessing.freeze_support()
+    if "--selftest" in sys.argv:
+        sys.exit(_run_selftest())
     main()

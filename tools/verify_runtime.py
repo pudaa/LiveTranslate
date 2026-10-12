@@ -126,7 +126,11 @@ for key in r.known_backends():
     mod, factory = r.resolve(key)
     print(f"{key} -> {mod}.{factory}")
 assert r.resolve(None) == r.resolve(r.DEFAULT_BACKEND)
-assert r.resolve("totally-bogus")[0].endswith("backends.whisper"), "fallback changed"
+# Unknown keys degrade to the *default* backend rather than hard-failing.
+# Assert the relationship, not a literal module name: pinning it to
+# "backends.whisper" made this check break the moment the default engine
+# changed, without anything actually being wrong.
+assert r.resolve("totally-bogus") == r.resolve(r.DEFAULT_BACKEND), "fallback changed"
 assert r.parse_device("cuda:0 (RTX 4060)") == ("cuda", 0)
 assert r.parse_device("cuda") == ("cuda", 0)
 assert r.parse_device("cpu") == ("cpu", 0)

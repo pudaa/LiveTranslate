@@ -53,7 +53,11 @@ def _resolve_image_path(path: str) -> str:
 
 # Default subtitle window settings
 DEFAULT_SUBTITLE_WIN_SETTINGS = {
-    "enabled": False,
+    # On by default in this fork: "watch a video that has no subtitles" is the
+    # entire point, so a fresh install that shows nothing until the user finds
+    # the right toggle is the wrong default. Upstream shipped False, where the
+    # chat-style overlay was the primary surface.
+    "enabled": True,
     "sentences": 1,
     "window_width": 860,
     "line_spacing": 8,
@@ -95,7 +99,12 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
     # arriving and the clock keeps resetting. It exists for a pause long enough
     # that the caption would otherwise sit mid-screen showing finished material.
     # Deliberately shorter than auto_hide_timeout, so the fade happens first.
-    "stale_hold_ms": 4000,
+    # How long a finished line stays before it starts to fade (see the
+    # _stale_alpha helper). The clock resets on every new character, so under
+    # continuous speech this never engages -- only a real pause triggers it.
+    # 2s reads like video subtitles; the original 4s felt like it never fired,
+    # which is exactly what a user reported.
+    "stale_hold_ms": 2000,
     "stale_fade_ms": 900,
     # How long a newly released unit takes to fade in -- the visual cue for
     # "this is what just appeared".

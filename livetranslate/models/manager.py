@@ -125,6 +125,132 @@ ASR_MODEL_IDS_HF = {
     "sensevoice": "FunAudioLLM/SenseVoiceSmall",
 }
 
+# ── sherpa-onnx (ONNX Runtime) models ───────────────────────────────────────
+# Unlike the ModelScope / HuggingFace models above, these are plain directories
+# under ./models, extracted from k2-fsa/sherpa-onnx GitHub Releases. They ship
+# inside the release bundle (see build_release.ps1 / build_exe.py), so a user's
+# installation never needs the network; download_sherpa_model() exists for dev
+# machines and for repairing a partial copy.
+#
+# Why these two coexist: sherpa's SenseVoice decode does not emit punctuation
+# (greedy_search + int8 drops those tokens -- see backends/sherpa_onnx.py), so
+# a CT-Transformer punctuation model runs after it. It adds ~15ms to an 8s clip.
+SHERPA_MODEL_PROFILES = {
+    "sensevoice-int8": {
+        "display_name": "SenseVoice Small (int8)",
+        "dir": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09",
+        "model_file": "model.int8.onnx",
+        "tokens_file": "tokens.txt",
+        "estimated_bytes": 237_000_000,
+        "url": (
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+            "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2"
+        ),
+    },
+    "punct-ct-transformer-int8": {
+        "display_name": "CT-Transformer punctuation (int8)",
+        "dir": "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8",
+        "model_file": "model.int8.onnx",
+        "tokens_file": None,
+        "estimated_bytes": 76_000_000,
+        "url": (
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+            "punctuation-models/"
+            "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2"
+        ),
+    },
+}
+
+DEFAULT_SHERPA_MODEL = "sensevoice-int8"
+DEFAULT_SHERPA_PUNCT_MODEL = "punct-ct-transformer-int8"
+
+
+def sherpa_profile(model_key: str | None) -> dict:
+    return SHERPA_MODEL_PROFILES.get(
+        model_key or "", SHERPA_MODEL_PROFILES[DEFAULT_SHERPA_MODEL]
+    )
+
+
+def sherpa_model_dir(model_key: str | None) -> Path:
+    return MODELS_DIR / sherpa_profile(model_key)["dir"]
+
+
+def _sherpa_dir_ready(profile: dict) -> bool:
+    d = MODELS_DIR / profile["dir"]
+    if not (d / profile["model_file"]).is_file():
+        return False
+    tokens_file = profile.get("tokens_file")
+    if tokens_file and not (d / tokens_file).is_file():
+        return False
+    return True
+
+
+def get_sherpa_model_paths(
+    model_key: str | None = None, punctuation: bool = True
+) -> dict | None:
+    """Resolve the sherpa-onnx files on disk, or None when incomplete.
+
+    Returns ``{"model": Path, "tokens": Path|None, "punctuation": Path|None}``.
+    ``None`` means the caller must either download (dev) or report a clear
+    "model missing" error (release) -- never silently degrade.
+
+    An unknown key returns ``None`` instead of falling back to the default:
+    quietly loading a model the user did not ask for is worse than failing.
+    ``sherpa_profile`` still falls back, but only for *display* purposes.
+    """
+    key = model_key or DEFAULT_SHERPA_MODEL
+    if key not in SHERPA_MODEL_PROFILES:
+        log.warning(
+            f"Unknown sherpa model key {model_key!r}; known keys: "
+            f"{', '.join(SHERPA_MODEL_PROFILES)}"
+        )
+        return None
+    profile = SHERPA_MODEL_PROFILES[key]
+    if not _sherpa_dir_ready(profile):
+        return None
+
+    d = MODELS_DIR / profile["dir"]
+    tokens_file = profile.get("tokens_file")
+    paths: dict = {
+        "model": d / profile["model_file"],
+        "tokens": (d / tokens_file) if tokens_file else None,
+        "punctuation": None,
+    }
+    if punctuation:
+        punct_profile = SHERPA_MODEL_PROFILES[DEFAULT_SHERPA_PUNCT_MODEL]
+        if _sherpa_dir_ready(punct_profile):
+            paths["punctuation"] = (
+                MODELS_DIR / punct_profile["dir"] / punct_profile["model_file"]
+            )
+    return paths
+
+
+def is_sherpa_cached(model_key: str | None = None) -> bool:
+    """Whether the ASR half is on disk (punctuation is optional)."""
+    return get_sherpa_model_paths(model_key, punctuation=False) is not None
+
+
+# ── Silero VAD (ONNX) ───────────────────────────────────────────────────────
+# The same v5 weights the silero-vad PyPI package ships, exported to ONNX and
+# run through onnxruntime. This is what lets the capture path drop torch --
+# the last piece of the CPU-only build. Verified identical to the torch path on
+# real lecture audio (max abs diff 2e-6, corr 1.000000).
+#
+# Layering note: this model and the ASR models are independent. The VAD runs in
+# the GUI process (audio capture), the ASR in a worker subprocess.
+SILERO_VAD_ONNX_FILE = "silero_vad.onnx"
+SILERO_VAD_ONNX_BYTES = 2_327_524
+
+
+def get_silero_vad_onnx_path() -> Path | None:
+    """Path to the ONNX VAD model, or None when it is not shipped."""
+    path = MODELS_DIR / SILERO_VAD_ONNX_FILE
+    return path if path.is_file() else None
+
+
+def is_silero_onnx_cached() -> bool:
+    return get_silero_vad_onnx_path() is not None
+
 
 def asr_model_id(
     engine_type: str, hub: str = "ms", funasr_model: str | None = None
@@ -140,6 +266,7 @@ def asr_model_id(
 
 ASR_DISPLAY_NAMES = {
     "funasr": "FunASR",
+    "sherpa-onnx": "sherpa-onnx",
     "sensevoice": "SenseVoice Small",
     "funasr-nano": "Fun-ASR-Nano",
     "funasr-mlt-nano": "Fun-ASR-MLT-Nano",
@@ -186,11 +313,24 @@ def normalize_asr_engine_selection(
         return "funasr", FUNASR_LEGACY_ENGINE_ALIASES[engine_type]
     if engine_type == "funasr":
         return "funasr", normalize_funasr_model_key(funasr_model)
-    return engine_type or "funasr", normalize_funasr_model_key(funasr_model)
+    # Unknown/absent: fall back to the *current* default, not to funasr. This
+    # used to hardcode "funasr", which meant a settings file that simply omitted
+    # asr_engine (the setup wizard writes only hub + proxy) was silently
+    # rewritten to the torch engine -- overriding the shipped default.
+    # Imported here rather than at module scope: registry is the layer above
+    # this one, and a import at the top would invert that ordering.
+    from livetranslate.asr.registry import DEFAULT_BACKEND
+
+    return engine_type or DEFAULT_BACKEND, normalize_funasr_model_key(funasr_model)
 
 
 def migrate_funasr_settings(settings: dict | None) -> dict | None:
     if not settings:
+        return settings
+    # Only migrate a file that actually names an engine. Writing "funasr" into a
+    # file that omits the key would defeat the merge in ControlPanel, where the
+    # default is read from config.yaml.
+    if "asr_engine" not in settings:
         return settings
     engine, model_key = normalize_asr_engine_selection(
         settings.get("asr_engine"), settings.get("funasr_model")
@@ -338,6 +478,14 @@ def _has_silero_pkg() -> bool:
 
 
 def is_silero_cached() -> bool:
+    """Whether a usable VAD model is available.
+
+    Prefers the ONNX model -- it ships with the release and needs no torch.
+    Falls back to the silero-vad package / torch.hub cache so a source install
+    that predates the ONNX switch still reports a working VAD.
+    """
+    if is_silero_onnx_cached():
+        return True
     if _has_silero_pkg():
         return True
     torch_hub = MODELS_DIR / "torch" / "hub"
@@ -402,6 +550,13 @@ def _hf_repo_complete(org: str, name: str, min_bytes: int = 50_000_000) -> bool:
 
 
 def is_asr_cached(engine_type, model_size="medium", hub="ms") -> bool:
+    if engine_type == "sherpa-onnx":
+        # `model_size` carries the sherpa model key here -- see
+        # _switch_asr_engine, which sets cache_model_key = sherpa_model.
+        # Deliberately strict: an unrecognised key reports "not cached" so a
+        # typo surfaces as a missing model instead of silently loading a
+        # different one (get_sherpa_model_paths would refuse it anyway).
+        return is_sherpa_cached(model_size)
     if engine_type == "funasr" or engine_type in FUNASR_LEGACY_ENGINE_ALIASES:
         model_key = (
             FUNASR_LEGACY_ENGINE_ALIASES[engine_type]
@@ -480,6 +635,11 @@ def get_missing_models(engine, model_size, hub) -> list:
             key = f"funasr:{model_key}"
             display = profile["display_name"]
             estimated_bytes = profile["estimated_bytes"]
+        elif engine == "sherpa-onnx":
+            profile = sherpa_profile(model_size)
+            key = f"sherpa-onnx:{profile['dir']}"
+            display = profile["display_name"]
+            estimated_bytes = profile["estimated_bytes"]
         elif engine == "whisper":
             key = engine if engine != "whisper" else f"whisper-{model_size}"
             display = f"Whisper {model_size}"
@@ -542,10 +702,23 @@ def get_local_model_path(engine_type, hub="ms", funasr_model: str | None = None)
 
 
 def download_silero(proxy: str = "system"):
+    # Order matters: the ONNX model is what release builds ship, and it needs no
+    # torch, so check it first. Otherwise a CPU-only install would fall through
+    # to `import torch` below and die.
+    if is_silero_onnx_cached():
+        log.info("Silero VAD (ONNX) is present, no download needed")
+        return
     if _has_silero_pkg():
         log.info("Silero VAD bundled by silero-vad package, no download needed")
         return
-    import torch
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cannot fetch Silero VAD: torch is not installed and the ONNX model "
+            "is missing from models/. Ship models/silero_vad.onnx -- the ONNX "
+            "model needs no torch."
+        ) from exc
 
     log.info("Downloading Silero VAD...")
     with _proxy_env(proxy):

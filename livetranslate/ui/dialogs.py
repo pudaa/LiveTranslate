@@ -29,11 +29,54 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from livetranslate.models.manager import download_asr, download_silero, get_missing_models
+from livetranslate.models.manager import (
+    download_asr,
+    download_silero,
+    get_missing_models,
+)
 from livetranslate.paths import I18N_DIR
+
+# NOTE: this module defines its own `SETTINGS_FILE = None` further down (see the
+# comment there -- control_panel injects the real path after import). Importing
+# the name plainly would be shadowed by that assignment, so bind it under an
+# alias. This bit me once: `_configured_engine` blew up with
+# "'NoneType' object has no attribute 'exists'" on a real settings file.
+from livetranslate.paths import SETTINGS_FILE as _SETTINGS_PATH
 from livetranslate.ui.i18n import t, get_lang
 
 log = logging.getLogger("LiveTranslate.Dialogs")
+
+
+def _configured_engine() -> tuple[str, str]:
+    """Engine and model key the app is actually configured to run.
+
+    The setup wizard used to hardcode ``funasr`` / ``sensevoice-small``. Once
+    sherpa-onnx became the default that made a release which *ships* the ONNX
+    models still report the torch model as missing, and then try to fetch it --
+    on a machine with no modelscope installed, so it died with a traceback.
+    """
+    from livetranslate.asr import registry
+    from livetranslate.models.manager import (
+        DEFAULT_FUNASR_MODEL,
+        DEFAULT_SHERPA_MODEL,
+        normalize_funasr_model_key,
+    )
+
+    settings: dict = {}
+    try:
+        if _SETTINGS_PATH.exists():
+            settings = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        log.warning("Could not read settings while resolving engine", exc_info=True)
+
+    engine = settings.get("asr_engine") or registry.DEFAULT_BACKEND
+    if engine == "sherpa-onnx":
+        return engine, settings.get("sherpa_model") or DEFAULT_SHERPA_MODEL
+    if engine == "funasr":
+        return engine, normalize_funasr_model_key(settings.get("funasr_model"))
+    if engine == "whisper":
+        return engine, settings.get("whisper_model_size") or "medium"
+    return engine, DEFAULT_FUNASR_MODEL
 
 
 def available_screen_height(widget: QWidget) -> int:
@@ -72,6 +115,10 @@ def make_scroll_area(content: QWidget) -> QScrollArea:
     area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     return area
 
+# Injected by control_panel after import (a late-binding trick to avoid a
+# circular import). Anything in this module that needs the real path should bind
+# it as `_SETTINGS_PATH` at the top -- assigning here shadows the imported name
+# for the whole module, which silently turns it into None.
 SETTINGS_FILE = None  # set by control_panel on import
 _save_settings = None  # set by control_panel on import
 
@@ -249,6 +296,20 @@ class SetupWizardDialog(QDialog):
 
         self._hub_combo.currentIndexChanged.connect(self._reset_countdown)
 
+        # If every model is already on disk, skip the countdown: on a release
+        # build they always ship with the app, so watching "Download (15s)" tick
+        # down is pure dead time that reads as a hang. _start_download will find
+        # the cache and complete immediately.
+        engine, model_key = _configured_engine()
+        hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
+        try:
+            already_ready = not get_missing_models(engine, model_key, hub)
+        except Exception:
+            log.warning("Could not pre-check models for the wizard", exc_info=True)
+            already_ready = False
+        if already_ready:
+            QTimer.singleShot(100, self._start_download)
+
     def _update_btn_countdown(self):
         self._download_btn.setText(
             f"{t('btn_start_download')} ({self._countdown}s)"
@@ -323,15 +384,28 @@ class SetupWizardDialog(QDialog):
             # models had already been pre-fetched still showed "Downloading ...",
             # which reads as "why is it downloading again?" even though the
             # snapshot call only re-verified the cache and finished in ~2s.
-            missing = get_missing_models("funasr", "sensevoice-small", hub)
+            #
+            # The engine is resolved from settings rather than assumed: see
+            # _configured_engine.
+            engine, model_key = _configured_engine()
+            missing = get_missing_models(engine, model_key, hub)
             if not missing:
                 log.info("Models already cached; nothing to download")
                 self._skipped = True
                 return
             for item in missing:
                 log.info(f"Missing model: {item['name']}")
+            if engine == "sherpa-onnx":
+                # These ship inside the release and are never fetched: they are
+                # plain directories extracted from GitHub Releases, which
+                # download_asr() knows nothing about.
+                raise RuntimeError(
+                    "sherpa-onnx models are missing from the models/ directory. "
+                    "They ship with the release -- re-extract the package. "
+                    "(No download will be attempted.)"
+                )
             download_silero(proxy=proxy)
-            download_asr("funasr", model_size="sensevoice-small", hub=hub, proxy=proxy)
+            download_asr(engine, model_size=model_key, hub=hub, proxy=proxy)
         except Exception as e:
             self._error = str(e)
             log.error(f"Download failed: {e}", exc_info=True)
@@ -356,23 +430,19 @@ class SetupWizardDialog(QDialog):
             f"\n{t('download_already_cached') if self._skipped else t('download_complete')}"
         )
         hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
-        from livetranslate.ui.control_panel import _save_settings
+        from livetranslate.ui.control_panel import _load_saved_settings, _save_settings
 
-        settings = {
-            "hub": hub,
-            "download_proxy": self._proxy,
-            "asr_engine": "funasr",
-            "funasr_model": "sensevoice-small",
-            "vad_mode": "silero",
-            "vad_threshold": 0.3,
-            "energy_threshold": 0.02,
-            "min_speech_duration": 1.0,
-            "max_speech_duration": 8.0,
-            "silence_mode": "auto",
-            "silence_duration": 0.8,
-            "asr_language": "auto",
-            "target_language": "zh",
-        }
+        # Deliberately minimal: the wizard owns exactly two decisions (download
+        # source and proxy). Everything else -- engine, palette, subtitle window,
+        # translation model -- comes from ControlPanel._default_settings, which
+        # reads config.yaml and merges this file on top.
+        #
+        # It used to write a complete snapshot instead, and that snapshot was
+        # missing `style` and `subtitle_mode`. The result on a packaged build was
+        # a black overlay and no captions at all, because the app then trusted a
+        # file that claimed those sections did not exist.
+        settings = dict(_load_saved_settings() or {})
+        settings.update({"hub": hub, "download_proxy": self._proxy})
         _save_settings(settings)
         QTimer.singleShot(500, self.accept)
 
